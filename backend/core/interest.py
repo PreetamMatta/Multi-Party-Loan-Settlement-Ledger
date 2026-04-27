@@ -24,7 +24,6 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Optional
 
 
 async def calculate_accrued_interest(
@@ -32,7 +31,7 @@ async def calculate_accrued_interest(
     borrower_id: uuid.UUID,
     fy_start: date,
     fy_end: date,
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> Decimal:
     """
     Total interest accrued on the (lender, borrower) loan within
@@ -58,7 +57,7 @@ async def generate_fy_statement(
     lender_id: uuid.UUID,
     borrower_id: uuid.UUID,
     financial_year: int,
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> dict:
     """
     Build a per-financial-year statement for tax filing.

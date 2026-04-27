@@ -19,7 +19,6 @@ Implemented in Session 8.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 
 async def export_all_tables(
@@ -63,7 +62,7 @@ def commit_and_push_export(
 
 async def run_nightly_export(
     db: object,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ) -> None:
     """
     Orchestrator called by cron / a scheduled task runner.

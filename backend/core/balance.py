@@ -14,14 +14,13 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Optional
 
 
 async def get_interpersonal_balance(
     lender_id: uuid.UUID,
     borrower_id: uuid.UUID,
     as_of_date: date,
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> Decimal:
     """
     Net amount owed by `borrower_id` to `lender_id` as of `as_of_date`.
@@ -53,7 +52,7 @@ async def get_interpersonal_balance(
 async def get_loan_balance(
     loan_id: uuid.UUID,
     as_of_date: date,
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> Decimal:
     """
     Outstanding principal on a bank loan as of `as_of_date`.
@@ -74,7 +73,7 @@ async def get_owner_contributions(
     owner_id: uuid.UUID,
     property_id: uuid.UUID,
     as_of_date: date,
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> dict[str, Decimal]:
     """
     Total amount this owner has contributed up to `as_of_date`, in property
@@ -99,7 +98,7 @@ async def project_exit_scenario(
     owner_id: uuid.UUID,
     property_id: uuid.UUID,
     market_value_property_currency: Decimal,
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> dict[str, Decimal]:
     """
     Compute the three buyout numbers for this owner per HOUSE_CONTEXT.md.

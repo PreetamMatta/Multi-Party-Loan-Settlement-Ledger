@@ -4,7 +4,7 @@ dependencies.py — FastAPI dependency providers.
 Stubs for DB session and auth. Real implementations land in Session 4.
 """
 
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 
 async def get_db() -> AsyncIterator[object]:

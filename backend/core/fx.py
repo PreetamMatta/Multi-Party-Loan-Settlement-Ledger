@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from typing import Optional
 
 
 class FXRateNotFoundError(Exception):
@@ -100,7 +99,7 @@ def stamp_fx_event(
 async def fetch_reference_rate(
     rate_date: date,
     pair: str = "USD_INR",
-    db: Optional[object] = None,
+    db: object | None = None,
 ) -> Decimal:
     """
     Look up the reference rate for a given date and currency pair.
@@ -116,4 +115,6 @@ async def fetch_reference_rate(
         - On miss: log a warning and raise FXRateNotFoundError.
         - Wire up the daily exchangerate.host snapshot job (separate cron).
     """
-    raise NotImplementedError("TODO Session 3: implement reference rate lookup against fx_rates table")
+    raise NotImplementedError(
+        "TODO Session 3: implement reference rate lookup against fx_rates table"
+    )

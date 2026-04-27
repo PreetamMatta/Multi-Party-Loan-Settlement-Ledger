@@ -19,7 +19,8 @@ services:
       timeout: 5s
       retries: 10
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
 
   api:
     image: python:3.11-slim
@@ -39,7 +40,8 @@ services:
       db:
         condition: service_healthy
     env_file:
-      - ./backend/.env
+      - path: ./backend/.env
+        required: false
 
   # Quick DB inspection during development.
   # Access at http://localhost:8080 — Server: db, User/Pass from backend/.env
