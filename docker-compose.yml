@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ledger}
+      POSTGRES_USER: ${POSTGRES_USER:-ledger_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ledger_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # Schema and seed are auto-applied on first init only (when db_data is empty).
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./backend/db/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ledger_user} -d ${POSTGRES_DB:-ledger}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    env_file:
+      - ./backend/.env
+
+  api:
+    image: python:3.11-slim
+    restart: unless-stopped
+    working_dir: /app
+    # Install deps on container start, then run uvicorn with hot-reload.
+    command: >
+      sh -c "
+        pip install --quiet -e '.[dev]' &&
+        uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      "
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+
+  # Quick DB inspection during development.
+  # Access at http://localhost:8080 — Server: db, User/Pass from backend/.env
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
