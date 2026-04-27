@@ -17,13 +17,11 @@ entrypoint script under backend/mcp/server.py.
 
 from __future__ import annotations
 
-from typing import Optional
-
 
 def get_balance(
     lender: str,
     borrower: str,
-    as_of_date: Optional[str] = None,
+    as_of_date: str | None = None,
 ) -> dict:
     """
     What does `borrower` owe `lender` (interpersonal balance)?
@@ -48,12 +46,12 @@ def get_balance(
 def record_payment(
     from_owner: str,
     to_owner_or_loan: str,
-    amount_source_currency: float,
+    amount_source_currency: str,
     source_currency: str,
-    amount_property_currency: float,
-    fx_rate_actual: float,
-    fx_rate_reference: float,
-    fee_source_currency: float,
+    amount_property_currency: str,
+    fx_rate_actual: str,
+    fx_rate_reference: str,
+    fee_source_currency: str,
     effective_date: str,
     description: str,
 ) -> dict:
@@ -89,7 +87,7 @@ def record_payment(
 def simulate_exit(
     owner_email: str,
     property_id: str,
-    market_value_property_currency: float,
+    market_value_property_currency: str,
 ) -> dict:
     """
     Compute the three buyout numbers for an owner exit scenario.
@@ -115,7 +113,7 @@ def simulate_exit(
 def log_settlement(
     from_owner: str,
     to_owner: str,
-    value_property_currency: float,
+    value_property_currency: str,
     method: str,
     description: str,
     effective_date: str,

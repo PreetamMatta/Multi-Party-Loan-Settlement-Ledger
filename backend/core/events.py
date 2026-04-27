@@ -14,10 +14,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -56,29 +56,35 @@ class LedgerEvent(BaseModel):
     property_id: uuid.UUID
     event_type: EventType
     actor_owner_id: uuid.UUID
-    target_owner_id: Optional[uuid.UUID] = None
-    loan_id: Optional[uuid.UUID] = None
+    target_owner_id: uuid.UUID | None = None
+    loan_id: uuid.UUID | None = None
 
-    amount_source_currency: Optional[Decimal] = None
-    source_currency: Optional[str] = None
-    amount_property_currency: Optional[Decimal] = None
-    property_currency: Optional[str] = None
-    fx_rate_actual: Optional[Decimal] = None
-    fx_rate_reference: Optional[Decimal] = None
-    fee_source_currency: Optional[Decimal] = None
-    inr_landed: Optional[Decimal] = None
+    amount_source_currency: Decimal | None = None
+    source_currency: str | None = None
+    amount_property_currency: Decimal | None = None
+    property_currency: str | None = None
+    fx_rate_actual: Decimal | None = None
+    fx_rate_reference: Decimal | None = None
+    fee_source_currency: Decimal | None = None
+    inr_landed: Decimal | None = None
 
     description: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    reverses_event_id: Optional[uuid.UUID] = None
+    reverses_event_id: uuid.UUID | None = None
 
-    hmac_signature: Optional[str] = None
+    hmac_signature: str | None = None
     recorded_by: str
-    recorded_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    recorded_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     effective_date: date
+
+    def check_is_signed(self) -> None:
+        """
+        Defense-in-depth: call this immediately before persisting to ensure
+        the event has been signed.
+        """
+        if not self.hmac_signature:
+            raise ValueError("LedgerEvent must be signed before persistence.")
 
 
 # -----------------------------------------------------------------------------
@@ -96,14 +102,12 @@ def _canonical_string(event: LedgerEvent) -> str:
     these will invalidate every previously signed row in the log.
     """
     amount_str = (
-        str(event.amount_property_currency)
-        if event.amount_property_currency is not None
-        else ""
+        str(event.amount_property_currency) if event.amount_property_currency is not None else ""
     )
     # Render recorded_at in a stable, timezone-aware ISO format.
     recorded_at = event.recorded_at
     if recorded_at.tzinfo is None:
-        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+        recorded_at = recorded_at.replace(tzinfo=UTC)
     recorded_at_str = recorded_at.isoformat()
 
     return (
@@ -171,17 +175,17 @@ def build_compensating_entry(
     is the caller's responsibility (Session 4 endpoints).
     """
     if original.amount_property_currency is None:
-        amount_negated: Optional[Decimal] = None
+        amount_negated: Decimal | None = None
     else:
         amount_negated = -original.amount_property_currency
 
     if original.amount_source_currency is None:
-        source_amount_negated: Optional[Decimal] = None
+        source_amount_negated: Decimal | None = None
     else:
         source_amount_negated = -original.amount_source_currency
 
     if original.inr_landed is None:
-        inr_landed_negated: Optional[Decimal] = None
+        inr_landed_negated: Decimal | None = None
     else:
         inr_landed_negated = -original.inr_landed
 

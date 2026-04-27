@@ -9,11 +9,13 @@ from fastapi import FastAPI
 
 from api.routers import (
     contributions,
-    exit as exit_router,
     fx,
     loans,
     owners,
     settlements,
+)
+from api.routers import (
+    exit as exit_router,
 )
 
 

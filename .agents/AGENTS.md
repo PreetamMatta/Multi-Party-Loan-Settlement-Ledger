@@ -61,7 +61,7 @@ These are hard constraints. Violations require an explicit migration discussion 
 
 1. **Append-only event log.** Every mutation is an immutable event row. No `UPDATE` or `DELETE` on ledger data — ever.
 2. **Balances are projections.** Never store a computed balance as a column. Always derive from event replay.
-3. **HMAC signatures on every event.** Each event row is signed. Canonical field order: `{id}|{event_type}|{actor_owner_id}|{amount_inr}|{effective_date}|{recorded_at}`.
+3. **HMAC signatures on every event.** Each event row is signed. Canonical field order: `{id}|{event_type}|{actor_owner_id}|{amount_property_currency}|{effective_date}|{recorded_at}`.
 4. **Compensating transactions for corrections.** Errors are fixed by writing a reversal event linked to the original via `reverses_event_id`. Never edit or delete the original.
 5. **Vanilla PostgreSQL only.** No Supabase RLS, no Neon branching, no extensions. Schema must run identically on any Postgres host.
 6. **N-owner generalization.** Never hardcode the number of owners. Owner count, equity splits, base currency, and property currency are all runtime config.

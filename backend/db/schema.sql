@@ -62,7 +62,7 @@ CREATE TABLE owners (
     property_id         UUID        NOT NULL REFERENCES properties(id) ON DELETE RESTRICT, -- which property
     display_name        TEXT        NOT NULL,                                 -- human-friendly name
     email               TEXT        NOT NULL,                                 -- magic-link auth identity
-    equity_pct          NUMERIC(6,4) NOT NULL,                                -- percentage (e.g. 33.3333). Sum per property should equal 100.
+    equity_pct          NUMERIC(7,4) NOT NULL,                                -- percentage (e.g. 33.3333). Sum per property should equal 100.
     floor_label         TEXT,                                                 -- usage allocation (e.g. "Floor 2") — separate from equity
     base_currency       TEXT        NOT NULL,                                 -- the currency this owner transacts in (e.g. 'USD')
     joined_at           DATE        NOT NULL,                                 -- date this owner joined the property
@@ -200,7 +200,14 @@ CREATE INDEX idx_interpersonal_loans_borrower ON interpersonal_loans(borrower_ow
 CREATE TABLE events (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     property_id                 UUID         NOT NULL REFERENCES properties(id) ON DELETE RESTRICT,
-    event_type                  TEXT         NOT NULL,                         -- see enum-as-text comment above
+    event_type                  TEXT         NOT NULL
+                                CHECK (event_type IN (
+                                    'CONTRIBUTION', 'EMI_PAYMENT', 'BULK_PREPAYMENT',
+                                    'INTERPERSONAL_LOAN_DISBURSEMENT', 'INTERPERSONAL_LOAN_REPAYMENT',
+                                    'INTERPERSONAL_RATE_CHANGE', 'SETTLEMENT', 'OPEX_EXPENSE',
+                                    'OPEX_SPLIT', 'FX_SNAPSHOT', 'EQUITY_ADJUSTMENT',
+                                    'EXIT', 'COMPENSATING_ENTRY'
+                                )),                                            -- see enum-as-text comment above
     actor_owner_id              UUID         NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,  -- who initiated this event
     target_owner_id             UUID         REFERENCES owners(id) ON DELETE RESTRICT,           -- counterparty for inter-personal events (nullable)
     loan_id                     UUID         REFERENCES bank_loans(id) ON DELETE RESTRICT,       -- linked bank loan if applicable (nullable)
@@ -254,7 +261,7 @@ CREATE TABLE opex_splits (
     id                              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id                        UUID         NOT NULL REFERENCES events(id) ON DELETE RESTRICT, -- the OPEX_EXPENSE event being split
     owner_id                        UUID         NOT NULL REFERENCES owners(id) ON DELETE RESTRICT,
-    share_pct                       NUMERIC(6,4) NOT NULL,                                          -- this owner's share (e.g. 33.3333)
+    share_pct                       NUMERIC(7,4) NOT NULL,                                          -- this owner's share (e.g. 33.3333)
     amount_owed_property_currency   NUMERIC(12,2) NOT NULL,                                         -- this owner's share in property currency
     created_at                      TIMESTAMPTZ  NOT NULL DEFAULT now(),
 
