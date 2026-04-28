@@ -7,6 +7,11 @@ The HMAC signature guarantees tamper-evidence: if any canonical field is altered
 after signing, verification will fail. The canonical field order is FROZEN —
 future event types must use the same order, or the entire historical event log
 will fail re-verification on a key rotation.
+
+See docs/business-logic/event-log.md for the full rationale and worked examples
+for each event type. That document is the authoritative source for what every
+event type means; this module is its implementation. If the two diverge, the
+document is right and this module needs fixing.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import hmac
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # -----------------------------------------------------------------------------
 # Event types — must match the documented enum in backend/db/schema.sql
 # -----------------------------------------------------------------------------
-class EventType(str, Enum):
+class EventType(StrEnum):
     CONTRIBUTION = "CONTRIBUTION"
     EMI_PAYMENT = "EMI_PAYMENT"
     BULK_PREPAYMENT = "BULK_PREPAYMENT"
@@ -204,7 +209,15 @@ def build_compensating_entry(
         fee_source_currency=original.fee_source_currency,
         inr_landed=inr_landed_negated,
         description=description,
-        metadata={"reverses_original_event": str(original.id)},
+        metadata={
+            "reverses_original_event": str(original.id),
+            # Stored so get_financial_effect can dispatch through the parent's
+            # routing path: the compensating entry's amounts/inr_landed are
+            # already negated, so running them through the parent's logic
+            # produces a clean negation in the parent's framing (lender/borrower,
+            # bank_loan sign, etc.).
+            "original_event_type": original.event_type.value,
+        },
         reverses_event_id=original.id,
         recorded_by=actor_email,
         effective_date=original.effective_date,
@@ -212,3 +225,297 @@ def build_compensating_entry(
 
     compensating.hmac_signature = sign_event(compensating, secret_key)
     return compensating
+
+
+# -----------------------------------------------------------------------------
+# Field validation — per-event-type required-field checks.
+# -----------------------------------------------------------------------------
+# These checks enforce the field-population contract documented in
+# docs/business-logic/event-log.md. They are intended to run at the API boundary
+# before persistence, to catch malformed events before they are signed and
+# written. Returning a list (vs raising) lets the API surface all problems in
+# one response rather than play whack-a-mole.
+def validate_event_fields(event: LedgerEvent) -> list[str]:
+    """
+    Validate that the event's populated fields match the contract for its
+    `event_type`. Returns a list of human-readable error strings; empty list
+    means the event is valid for persistence.
+
+    This is a structural check, not an arithmetic one. It does NOT verify
+    that amounts are non-zero, that FX rates are in a sensible range, or
+    that the actor and target are both real owners — those are the API
+    layer's job. It only checks "for an event of this type, are the
+    fields populated as documented?".
+    """
+    errors: list[str] = []
+    et = event.event_type
+
+    # All financial-money events need amount_property_currency to drive
+    # balance math. The non-financial events are FX_SNAPSHOT,
+    # INTERPERSONAL_RATE_CHANGE, EQUITY_ADJUSTMENT, and EXIT.
+    needs_amount = {
+        EventType.CONTRIBUTION,
+        EventType.EMI_PAYMENT,
+        EventType.BULK_PREPAYMENT,
+        EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+        EventType.INTERPERSONAL_LOAN_REPAYMENT,
+        EventType.SETTLEMENT,
+        EventType.OPEX_EXPENSE,
+        EventType.OPEX_SPLIT,
+    }
+    if et in needs_amount and event.amount_property_currency is None:
+        errors.append(f"{et.value}: amount_property_currency is required.")
+
+    if et is EventType.COMPENSATING_ENTRY:
+        parent_type_str = event.metadata.get("original_event_type")
+        if parent_type_str:
+            try:
+                parent_type = EventType(parent_type_str)
+                if parent_type in needs_amount and event.amount_property_currency is None:
+                    errors.append(f"{et.value}: amount_property_currency is required.")
+            except ValueError:
+                pass
+
+    # Cross-currency CONTRIBUTION events require the dual-rate stamp.
+    # Same-currency contributions (e.g., an INR-based owner contributing to
+    # an INR-denominated property) have no FX conversion and therefore no
+    # fx_rate_actual or amount_source_currency. We only require those fields
+    # when source_currency != property_currency. See docs/business-logic/
+    # event-log.md for the CONTRIBUTION contract.
+    if et is EventType.CONTRIBUTION:
+        is_cross_currency = (
+            event.source_currency is not None
+            and event.property_currency is not None
+            and event.source_currency != event.property_currency
+        )
+        if is_cross_currency:
+            if event.fx_rate_actual is None:
+                errors.append(
+                    "CONTRIBUTION: fx_rate_actual is required for cross-currency stamping."
+                )
+            if event.amount_source_currency is None:
+                errors.append("CONTRIBUTION: amount_source_currency is required.")
+
+    # Inter-personal events require a target (the counterparty).
+    pair_required = {
+        EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+        EventType.INTERPERSONAL_LOAN_REPAYMENT,
+        EventType.INTERPERSONAL_RATE_CHANGE,
+        EventType.SETTLEMENT,
+        EventType.OPEX_SPLIT,
+    }
+    if et in pair_required and event.target_owner_id is None:
+        errors.append(f"{et.value}: target_owner_id is required (counterparty).")
+
+    # actor != target check — but NOT for OPEX_SPLIT. The payer's own share
+    # of an OpEx expense is recorded as a split row where actor == target
+    # (the payer's share owed to themselves — a no-op for inter-personal
+    # balance, but still required so the per-event opex contribution total
+    # is complete). See docs/business-logic/event-log.md, OPEX_SPLIT section.
+    distinct_pair_required = pair_required - {EventType.OPEX_SPLIT}
+    if et in distinct_pair_required and event.target_owner_id == event.actor_owner_id:
+        errors.append(f"{et.value}: target_owner_id must differ from actor_owner_id.")
+
+    # Bank-loan-linked events need a loan_id.
+    needs_loan = {EventType.EMI_PAYMENT, EventType.BULK_PREPAYMENT}
+    if et in needs_loan and event.loan_id is None:
+        errors.append(f"{et.value}: loan_id is required.")
+
+    # Rate change must carry the new rate in metadata.
+    if et is EventType.INTERPERSONAL_RATE_CHANGE:
+        if "new_rate_pct" not in event.metadata:
+            errors.append("INTERPERSONAL_RATE_CHANGE: metadata.new_rate_pct is required.")
+
+    # Compensating entry must reference the original event.
+    if et is EventType.COMPENSATING_ENTRY and event.reverses_event_id is None:
+        errors.append("COMPENSATING_ENTRY: reverses_event_id is required.")
+
+    # FX_SNAPSHOT is non-financial and carries its data in metadata.
+    if et is EventType.FX_SNAPSHOT:
+        if "currency_pair" not in event.metadata:
+            errors.append("FX_SNAPSHOT: metadata.currency_pair is required.")
+        if "reference_rate" not in event.metadata:
+            errors.append("FX_SNAPSHOT: metadata.reference_rate is required.")
+
+    # EQUITY_ADJUSTMENT must record the new equity_pct.
+    if et is EventType.EQUITY_ADJUSTMENT:
+        if "new_equity_pct" not in event.metadata:
+            errors.append("EQUITY_ADJUSTMENT: metadata.new_equity_pct is required.")
+
+    # EXIT must record the buyout terms.
+    if et is EventType.EXIT:
+        if "buyout_formula" not in event.metadata:
+            errors.append("EXIT: metadata.buyout_formula is required.")
+        if "buyout_amount" not in event.metadata:
+            errors.append("EXIT: metadata.buyout_amount is required.")
+
+    return errors
+
+
+# -----------------------------------------------------------------------------
+# Financial effect routing — "what balances does this event move?"
+# -----------------------------------------------------------------------------
+# This function centralizes the routing logic so the balance projection engine
+# (Session 3) does not need to re-derive it. The output is a structured dict
+# that names exactly which balance(s) move and by how much.
+#
+# A return value with no keys (or all-zero deltas) means the event has no
+# balance impact (e.g., FX_SNAPSHOT, INTERPERSONAL_RATE_CHANGE).
+def get_financial_effect(event: LedgerEvent) -> dict[str, Any]:
+    """
+    Describe which balances this event moves. The balance projection engine
+    consumes this dict to apply the right deltas without re-implementing
+    per-event-type routing logic.
+
+    Output schema (keys are present only when relevant):
+        {
+            "interpersonal": {
+                "lender":   UUID,
+                "borrower": UUID,
+                "delta":    Decimal,   # positive = borrower owes lender more
+            },
+            "bank_loan": {
+                "loan_id": UUID,
+                "delta":   Decimal,    # negative = principal reduced
+            },
+            "owner_capex": {
+                "owner_id": UUID,
+                "delta":    Decimal,   # positive = capex contribution increase
+            },
+            "owner_opex": {
+                "owner_id": UUID,
+                "delta":    Decimal,   # positive = opex contribution increase
+            },
+        }
+
+    The dict is the contract; balance.py and tests both depend on its shape.
+
+    Compensating entries: dispatched through the parent event's routing path
+    using `metadata.original_event_type`. The compensating entry's amount and
+    inr_landed are already negated by `build_compensating_entry`, so running
+    them through the parent's logic produces correctly negated deltas in the
+    parent's framing — preserving lender/borrower order, the bank_loan sign,
+    and the inr_landed-based credit for cross-currency contributions. If
+    `original_event_type` is missing (e.g., a hand-built compensating entry
+    that did not go through the helper), the function returns an empty dict
+    and the caller is expected to flag the row.
+    """
+    # No-op event types — explicit so callers don't have to special-case.
+    no_op_types = {
+        EventType.FX_SNAPSHOT,
+        EventType.INTERPERSONAL_RATE_CHANGE,
+        EventType.EQUITY_ADJUSTMENT,
+        EventType.EXIT,
+        EventType.OPEX_EXPENSE,  # the gross expense; splits drive the actual deltas
+    }
+    if event.event_type in no_op_types:
+        return {}
+
+    if event.event_type is EventType.COMPENSATING_ENTRY:
+        parent_type_str = event.metadata.get("original_event_type")
+        if not parent_type_str:
+            return {}
+        try:
+            parent_type = EventType(parent_type_str)
+        except ValueError:
+            return {}
+        # Refuse to recurse if the metadata claims another COMPENSATING_ENTRY
+        # as the parent — that's nonsensical and would loop.
+        if parent_type is EventType.COMPENSATING_ENTRY or parent_type in no_op_types:
+            return {}
+        return _route_by_type(parent_type, event)
+
+    return _route_by_type(event.event_type, event)
+
+
+def _route_by_type(logical_type: EventType, event: LedgerEvent) -> dict[str, Any]:
+    """
+    Apply the routing for a given logical event type using the field values on
+    `event`. Used directly for normal events, and used with `logical_type =
+    parent_event_type` for COMPENSATING_ENTRY rows so the negated amounts on
+    the compensating entry flow through the parent's framing.
+    """
+    effect: dict[str, Any] = {}
+    amount = event.amount_property_currency
+
+    if logical_type is EventType.CONTRIBUTION:
+        # Credit the actor's CapEx with inr_landed (the dual-rate rule),
+        # falling back to amount_property_currency when inr_landed is not
+        # set (e.g., same-currency contributions). This same logic applies
+        # when routing a compensating entry, where inr_landed is already
+        # negated — yielding a clean cancellation of the original credit.
+        credit = event.inr_landed if event.inr_landed is not None else amount
+        if credit is not None:
+            effect["owner_capex"] = {"owner_id": event.actor_owner_id, "delta": credit}
+        return effect
+
+    if logical_type is EventType.EMI_PAYMENT:
+        # The payer's CapEx grows by the principal portion paid (passed via
+        # metadata) — but routing the principal/interest split is the
+        # caller's job. Here we credit the gross amount to capex; balance.py
+        # consults metadata for the principal-only portion.
+        if amount is not None:
+            effect["owner_capex"] = {"owner_id": event.actor_owner_id, "delta": amount}
+        if event.loan_id is not None and amount is not None:
+            effect["bank_loan"] = {"loan_id": event.loan_id, "delta": -amount}
+        return effect
+
+    if logical_type is EventType.BULK_PREPAYMENT:
+        if amount is not None:
+            effect["owner_capex"] = {"owner_id": event.actor_owner_id, "delta": amount}
+        if event.loan_id is not None and amount is not None:
+            effect["bank_loan"] = {"loan_id": event.loan_id, "delta": -amount}
+        return effect
+
+    if logical_type is EventType.INTERPERSONAL_LOAN_DISBURSEMENT:
+        if event.target_owner_id is not None and amount is not None:
+            effect["interpersonal"] = {
+                "lender": event.actor_owner_id,
+                "borrower": event.target_owner_id,
+                "delta": amount,
+            }
+        return effect
+
+    if logical_type is EventType.INTERPERSONAL_LOAN_REPAYMENT:
+        # actor=borrower repaying target=lender. Normalized to lender→borrower
+        # framing with a negative delta.
+        if event.target_owner_id is not None and amount is not None:
+            effect["interpersonal"] = {
+                "lender": event.target_owner_id,
+                "borrower": event.actor_owner_id,
+                "delta": -amount,
+            }
+        return effect
+
+    if logical_type is EventType.SETTLEMENT:
+        # Conventional direction: actor=payer, target=recipient. The payer
+        # reduces what they owed the recipient (or, equivalently, the
+        # recipient now owes the payer if there was no debt).
+        if event.target_owner_id is not None and amount is not None:
+            effect["interpersonal"] = {
+                "lender": event.target_owner_id,
+                "borrower": event.actor_owner_id,
+                "delta": -amount,
+            }
+        return effect
+
+    if logical_type is EventType.OPEX_SPLIT:
+        # actor=the owner whose share this is, target=the owner who paid.
+        # The split's actor owes the target their share — except when the
+        # actor IS the target (the payer's own share, which is a no-op for
+        # inter-personal balance but still records owner_opex).
+        if (
+            event.target_owner_id is not None
+            and event.target_owner_id != event.actor_owner_id
+            and amount is not None
+        ):
+            effect["interpersonal"] = {
+                "lender": event.target_owner_id,
+                "borrower": event.actor_owner_id,
+                "delta": amount,
+            }
+        if amount is not None:
+            effect["owner_opex"] = {"owner_id": event.actor_owner_id, "delta": amount}
+        return effect
+
+    raise ValueError(f"Unhandled event type: {logical_type}")
