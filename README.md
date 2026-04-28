@@ -1,5 +1,7 @@
 # Multi-Party Loan & Settlement Ledger
 
+![Backend CI](https://github.com/PreetamMatta/Multi-Party-Loan-Settlement-Ledger/actions/workflows/backend-ci.yml/badge.svg)
+
 > ⚠️ **Keep this file current.** Update the directory tree, quickstart steps, and environment variable list
 > whenever they change. Outdated READMEs mislead contributors and future AI sessions alike.
 

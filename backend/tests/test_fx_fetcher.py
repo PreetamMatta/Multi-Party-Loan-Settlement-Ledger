@@ -78,9 +78,7 @@ async def test_fetch_reference_rate_falls_back_on_api_failure(httpx_mock, caplog
         url=f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}?base=USD&symbols=INR",
         status_code=500,
     )
-    store = _StubFallbackStore(
-        rows=[(fallback_date, "USD_INR", Decimal("83.1000"))]
-    )
+    store = _StubFallbackStore(rows=[(fallback_date, "USD_INR", Decimal("83.1000"))])
     with caplog.at_level(logging.WARNING):
         rate = await fetch_reference_rate(rate_date, pair="USD_INR", fallback_store=store)
     assert rate == Decimal("83.1000")
@@ -134,3 +132,96 @@ async def test_fetch_reference_rate_raises_on_invalid_pair():
     """
     with pytest.raises(ValueError):
         await fetch_reference_rate(date(2026, 5, 1), pair="USDINR")
+
+
+@pytest.mark.asyncio
+async def test_fetch_reference_rate_falls_back_on_malformed_json(httpx_mock):
+    """
+    A 200 response whose body is not valid JSON must be treated as a
+    failed fetch (not a crash). Real APIs occasionally return HTML error
+    pages with a 200 status during outages — we cannot let that propagate
+    as a parser exception.
+    """
+    rate_date = date(2026, 5, 1)
+    httpx_mock.add_response(
+        url=f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}?base=USD&symbols=INR",
+        content=b"<html>not json</html>",
+        headers={"content-type": "text/html"},
+    )
+    fallback_date = date(2026, 4, 30)
+    store = _StubFallbackStore(rows=[(fallback_date, "USD_INR", Decimal("83.10"))])
+    rate = await fetch_reference_rate(rate_date, pair="USD_INR", fallback_store=store)
+    assert rate == Decimal("83.10")
+
+
+@pytest.mark.asyncio
+async def test_fetch_reference_rate_falls_back_when_rates_missing(httpx_mock):
+    """
+    A 200 response whose body is JSON but lacks the expected `rates`
+    field is treated as a failed fetch. exchangerate.host has historically
+    changed its response shape; defensive parsing keeps the ledger
+    resilient.
+    """
+    rate_date = date(2026, 5, 1)
+    httpx_mock.add_response(
+        url=f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}?base=USD&symbols=INR",
+        json={"base": "USD", "date": rate_date.isoformat()},  # no `rates` key
+    )
+    fallback_date = date(2026, 4, 30)
+    store = _StubFallbackStore(rows=[(fallback_date, "USD_INR", Decimal("83.10"))])
+    rate = await fetch_reference_rate(rate_date, pair="USD_INR", fallback_store=store)
+    assert rate == Decimal("83.10")
+
+
+@pytest.mark.asyncio
+async def test_fetch_reference_rate_falls_back_when_quote_missing(httpx_mock):
+    """
+    A 200 response with a `rates` dict that doesn't contain the requested
+    quote currency is a failed fetch. This is what happens when the
+    upstream provider doesn't track that pair on a given date.
+    """
+    rate_date = date(2026, 5, 1)
+    httpx_mock.add_response(
+        url=f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}?base=USD&symbols=INR",
+        json={"base": "USD", "rates": {"EUR": 0.92}},  # no INR
+    )
+    fallback_date = date(2026, 4, 30)
+    store = _StubFallbackStore(rows=[(fallback_date, "USD_INR", Decimal("83.10"))])
+    rate = await fetch_reference_rate(rate_date, pair="USD_INR", fallback_store=store)
+    assert rate == Decimal("83.10")
+
+
+@pytest.mark.asyncio
+async def test_fetch_reference_rate_falls_back_on_unparseable_rate_value(httpx_mock):
+    """
+    A 200 response whose rate value is not coercible to Decimal (e.g.,
+    `null`, a string like 'unavailable') must be treated as a failed
+    fetch rather than crashing.
+    """
+    rate_date = date(2026, 5, 1)
+    httpx_mock.add_response(
+        url=f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}?base=USD&symbols=INR",
+        json={"base": "USD", "rates": {"INR": "unavailable"}},
+    )
+    fallback_date = date(2026, 4, 30)
+    store = _StubFallbackStore(rows=[(fallback_date, "USD_INR", Decimal("83.10"))])
+    rate = await fetch_reference_rate(rate_date, pair="USD_INR", fallback_store=store)
+    assert rate == Decimal("83.10")
+
+
+@pytest.mark.asyncio
+async def test_fetch_reference_rate_falls_back_on_null_rate_value(httpx_mock):
+    """
+    A `null` rate value (the API has no data for that pair on that date)
+    must be treated as a failed fetch. This is documented behavior for
+    exchangerate.host on weekends and holidays for some pairs.
+    """
+    rate_date = date(2026, 5, 1)
+    httpx_mock.add_response(
+        url=f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}?base=USD&symbols=INR",
+        json={"base": "USD", "rates": {"INR": None}},
+    )
+    fallback_date = date(2026, 4, 30)
+    store = _StubFallbackStore(rows=[(fallback_date, "USD_INR", Decimal("83.10"))])
+    rate = await fetch_reference_rate(rate_date, pair="USD_INR", fallback_store=store)
+    assert rate == Decimal("83.10")

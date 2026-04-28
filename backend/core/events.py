@@ -21,7 +21,7 @@ import hmac
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # -----------------------------------------------------------------------------
 # Event types — must match the documented enum in backend/db/schema.sql
 # -----------------------------------------------------------------------------
-class EventType(str, Enum):
+class EventType(StrEnum):
     CONTRIBUTION = "CONTRIBUTION"
     EMI_PAYMENT = "EMI_PAYMENT"
     BULK_PREPAYMENT = "BULK_PREPAYMENT"

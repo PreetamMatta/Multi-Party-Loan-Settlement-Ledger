@@ -478,13 +478,9 @@ class TestFinancialEffect:
         assert original_effect["interpersonal"]["delta"] == Decimal("300000")
         assert comp_effect["interpersonal"]["delta"] == Decimal("-300000")
         # Same lender/borrower framing.
+        assert original_effect["interpersonal"]["lender"] == comp_effect["interpersonal"]["lender"]
         assert (
-            original_effect["interpersonal"]["lender"]
-            == comp_effect["interpersonal"]["lender"]
-        )
-        assert (
-            original_effect["interpersonal"]["borrower"]
-            == comp_effect["interpersonal"]["borrower"]
+            original_effect["interpersonal"]["borrower"] == comp_effect["interpersonal"]["borrower"]
         )
 
     def test_fx_snapshot_has_no_financial_effect(self, make_event):
@@ -577,15 +573,13 @@ class TestCompensatingEntryRouting:
         # Bank loan deltas must sum to zero.
         assert original_effect["bank_loan"]["delta"] == Decimal("-50000")
         assert comp_effect["bank_loan"]["delta"] == Decimal("50000")
-        assert (
-            original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"]
-            == Decimal("0")
+        assert original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"] == Decimal(
+            "0"
         )
         # CapEx deltas must sum to zero too.
-        assert (
-            original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"]["delta"]
-            == Decimal("0")
-        )
+        assert original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"][
+            "delta"
+        ] == Decimal("0")
         # Same loan_id and same owner_id on both sides.
         assert comp_effect["bank_loan"]["loan_id"] == loan_id
         assert comp_effect["owner_capex"]["owner_id"] == original.actor_owner_id
@@ -610,9 +604,8 @@ class TestCompensatingEntryRouting:
         )
         original_effect = get_financial_effect(original)
         comp_effect = get_financial_effect(comp)
-        assert (
-            original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"]
-            == Decimal("0")
+        assert original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"] == Decimal(
+            "0"
         )
 
     def test_cross_currency_contribution_compensation_cancels_inr_landed_credit(
@@ -640,10 +633,9 @@ class TestCompensatingEntryRouting:
         # The capex deltas must sum to exactly zero — no residue.
         assert original_effect["owner_capex"]["delta"] == Decimal("413925.00")
         assert comp_effect["owner_capex"]["delta"] == Decimal("-413925.00")
-        assert (
-            original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"]["delta"]
-            == Decimal("0")
-        )
+        assert original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"][
+            "delta"
+        ] == Decimal("0")
 
     def test_repayment_compensation_preserves_pair_framing(self, make_event, secret_key):
         """
@@ -677,11 +669,9 @@ class TestCompensatingEntryRouting:
         assert comp_effect["interpersonal"]["lender"] == lender_id
         assert comp_effect["interpersonal"]["borrower"] == borrower_id
         # Net-zero on the pair.
-        assert (
-            original_effect["interpersonal"]["delta"]
-            + comp_effect["interpersonal"]["delta"]
-            == Decimal("0")
-        )
+        assert original_effect["interpersonal"]["delta"] + comp_effect["interpersonal"][
+            "delta"
+        ] == Decimal("0")
 
     def test_settlement_compensation_preserves_pair_framing(self, make_event, secret_key):
         """
@@ -712,11 +702,9 @@ class TestCompensatingEntryRouting:
         assert original_effect["interpersonal"]["borrower"] == payer_id
         assert comp_effect["interpersonal"]["lender"] == recipient_id
         assert comp_effect["interpersonal"]["borrower"] == payer_id
-        assert (
-            original_effect["interpersonal"]["delta"]
-            + comp_effect["interpersonal"]["delta"]
-            == Decimal("0")
-        )
+        assert original_effect["interpersonal"]["delta"] + comp_effect["interpersonal"][
+            "delta"
+        ] == Decimal("0")
 
     def test_opex_split_compensation_preserves_pair_framing(self, make_event, secret_key):
         """
@@ -746,20 +734,15 @@ class TestCompensatingEntryRouting:
         assert original_effect["interpersonal"]["borrower"] == share_owner_id
         assert comp_effect["interpersonal"]["lender"] == payer_id
         assert comp_effect["interpersonal"]["borrower"] == share_owner_id
-        assert (
-            original_effect["interpersonal"]["delta"]
-            + comp_effect["interpersonal"]["delta"]
-            == Decimal("0")
-        )
+        assert original_effect["interpersonal"]["delta"] + comp_effect["interpersonal"][
+            "delta"
+        ] == Decimal("0")
         # owner_opex must also net to zero.
-        assert (
-            original_effect["owner_opex"]["delta"] + comp_effect["owner_opex"]["delta"]
-            == Decimal("0")
-        )
+        assert original_effect["owner_opex"]["delta"] + comp_effect["owner_opex"][
+            "delta"
+        ] == Decimal("0")
 
-    def test_compensating_entry_with_missing_metadata_returns_empty_effect(
-        self, make_event
-    ):
+    def test_compensating_entry_with_missing_metadata_returns_empty_effect(self, make_event):
         """
         A COMPENSATING_ENTRY without `original_event_type` in metadata
         cannot be routed. The function must return an empty effect dict
@@ -849,3 +832,147 @@ class TestValidateEdgeCases:
         )
         errors = validate_event_fields(evt)
         assert any("must differ" in e for e in errors)
+
+    def test_equity_adjustment_requires_new_equity_pct(self, make_event):
+        """
+        An EQUITY_ADJUSTMENT without metadata.new_equity_pct cannot record
+        the new equity stake — the entire point of the event. Validation
+        must reject it so it never reaches the database.
+        """
+        evt = make_event(
+            event_type=EventType.EQUITY_ADJUSTMENT,
+            amount_property_currency=None,
+            metadata={},
+        )
+        errors = validate_event_fields(evt)
+        assert any("new_equity_pct" in e for e in errors)
+
+    def test_interpersonal_rate_change_missing_target_owner(self, make_event):
+        """
+        INTERPERSONAL_RATE_CHANGE must have a target_owner_id (the borrower
+        whose pair the rate change applies to). Without it the rate change
+        is unrouteable — we wouldn't know which pair's accrual schedule to
+        update.
+        """
+        evt = make_event(
+            event_type=EventType.INTERPERSONAL_RATE_CHANGE,
+            target_owner_id=None,
+            amount_property_currency=None,
+            inr_landed=None,
+            metadata={"new_rate_pct": Decimal("3.0")},
+        )
+        errors = validate_event_fields(evt)
+        assert any("target_owner_id" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# LedgerEvent.check_is_signed — defense-in-depth pre-persist check
+# ---------------------------------------------------------------------------
+class TestCheckIsSigned:
+    def test_check_is_signed_raises_when_unsigned(self, make_event):
+        """
+        check_is_signed must raise on an event that has not been signed.
+        Persisting an unsigned event would silently bypass the
+        tamper-evidence layer — this guard catches the mistake at the
+        persistence boundary.
+        """
+        import pytest as _pytest
+
+        evt = make_event()  # hmac_signature defaults to None
+        with _pytest.raises(ValueError, match="must be signed"):
+            evt.check_is_signed()
+
+    def test_check_is_signed_passes_when_signed(self, make_event, secret_key):
+        """
+        check_is_signed must NOT raise on a properly signed event. False
+        positives here would block legitimate writes.
+        """
+        evt = make_event()
+        evt.hmac_signature = sign_event(evt, secret_key)
+        evt.check_is_signed()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# build_compensating_entry — None-amount handling and edge cases
+# ---------------------------------------------------------------------------
+class TestBuildCompensatingEntryEdges:
+    def test_compensates_event_with_no_monetary_amounts(self, make_event, secret_key):
+        """
+        Some event types legitimately have None amount fields (e.g., a bad
+        INTERPERSONAL_RATE_CHANGE that needs reversing). build_compensating_entry
+        must handle None gracefully — passing None through rather than
+        attempting to negate it (which would raise).
+        """
+        original = make_event(
+            event_type=EventType.INTERPERSONAL_RATE_CHANGE,
+            target_owner_id=uuid.uuid4(),
+            amount_source_currency=None,
+            amount_property_currency=None,
+            inr_landed=None,
+            metadata={"new_rate_pct": Decimal("5.0")},
+        )
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="Reverse the rate change",
+            secret_key=secret_key,
+        )
+        assert comp.amount_source_currency is None
+        assert comp.amount_property_currency is None
+        assert comp.inr_landed is None
+        assert comp.reverses_event_id == original.id
+
+    def test_compensating_entry_with_invalid_parent_type_returns_empty_effect(self, make_event):
+        """
+        A COMPENSATING_ENTRY whose metadata.original_event_type is not a
+        valid EventType (e.g., schema corruption, hand-edited row) must
+        return an empty effect dict rather than raising. The caller flags
+        the row for review.
+        """
+        evt = make_event(
+            event_type=EventType.COMPENSATING_ENTRY,
+            amount_property_currency=Decimal("-100"),
+            reverses_event_id=uuid.uuid4(),
+            metadata={
+                "reverses_original_event": "some-uuid",
+                "original_event_type": "NOT_A_REAL_TYPE",
+            },
+        )
+        assert get_financial_effect(evt) == {}
+
+    def test_compensating_entry_with_compensating_parent_returns_empty(self, make_event):
+        """
+        A COMPENSATING_ENTRY claiming another COMPENSATING_ENTRY as its
+        parent is nonsensical (you don't compensate a compensation —
+        you'd write a fresh corrective event). The recursion guard returns
+        empty so the projection engine doesn't loop or produce a
+        spurious effect.
+        """
+        evt = make_event(
+            event_type=EventType.COMPENSATING_ENTRY,
+            amount_property_currency=Decimal("-100"),
+            reverses_event_id=uuid.uuid4(),
+            metadata={
+                "reverses_original_event": "some-uuid",
+                "original_event_type": EventType.COMPENSATING_ENTRY.value,
+            },
+        )
+        assert get_financial_effect(evt) == {}
+
+    def test_compensating_entry_with_no_op_parent_returns_empty(self, make_event):
+        """
+        A COMPENSATING_ENTRY whose original was a no-op type (FX_SNAPSHOT,
+        EQUITY_ADJUSTMENT, etc.) has nothing to negate financially. The
+        guard returns empty so we don't accidentally produce ghost balance
+        effects from a metadata-only correction.
+        """
+        evt = make_event(
+            event_type=EventType.COMPENSATING_ENTRY,
+            amount_property_currency=None,
+            reverses_event_id=uuid.uuid4(),
+            metadata={
+                "reverses_original_event": "some-uuid",
+                "original_event_type": EventType.FX_SNAPSHOT.value,
+            },
+        )
+        assert get_financial_effect(evt) == {}

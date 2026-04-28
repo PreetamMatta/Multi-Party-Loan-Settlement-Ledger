@@ -152,8 +152,8 @@ class TestStampFXEvent:
             rate_actual=rate_actual,
             rate_reference=Decimal("83.45"),
         )
-        gross_credit_wrong = amount_source * rate_actual            # 416,000
-        net_credit_correct = (amount_source - fee) * rate_actual    # 413,920
+        gross_credit_wrong = amount_source * rate_actual  # 416,000
+        net_credit_correct = (amount_source - fee) * rate_actual  # 413,920
         assert stamp.inr_landed != gross_credit_wrong
         assert stamp.inr_landed == net_credit_correct
 

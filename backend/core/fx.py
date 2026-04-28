@@ -40,8 +40,7 @@ class FXRateFallbackStore(Protocol):
 
     async def get_latest_reference_rate_on_or_before(
         self, on_or_before: date, currency_pair: str
-    ) -> tuple[date, Decimal] | None:
-        ...
+    ) -> tuple[date, Decimal] | None: ...
 
 
 @dataclass(frozen=True)
