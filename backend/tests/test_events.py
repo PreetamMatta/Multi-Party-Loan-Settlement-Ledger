@@ -537,3 +537,315 @@ class TestFinancialEffect:
         assert "interpersonal" not in effect
         assert effect["owner_opex"]["owner_id"] == owner_id
         assert effect["owner_opex"]["delta"] == Decimal("40000")
+
+
+# ---------------------------------------------------------------------------
+# Compensating-entry routing — coverage for every parent event type.
+# ---------------------------------------------------------------------------
+# Each test pairs an original event with its compensating entry and asserts
+# that summing both effect dicts yields zero on the affected balance(s).
+# These tests guard against the four routing bugs found in PR review:
+#   1. bank_loan delta sign for EMI_PAYMENT/BULK_PREPAYMENT compensations
+#   2. inr_landed vs amount_property_currency drift on cross-currency
+#      CONTRIBUTION compensations
+#   3. lender/borrower inversion on REPAYMENT/SETTLEMENT compensations
+#   4. lender/borrower inversion on OPEX_SPLIT compensations
+class TestCompensatingEntryRouting:
+    def test_emi_payment_compensation_cancels_bank_loan_delta(self, make_event, secret_key):
+        """
+        Compensating an EMI_PAYMENT must produce a bank_loan delta that
+        exactly cancels the original. The original reduces principal
+        (negative delta); the compensating entry must INCREASE principal
+        (positive delta). Without this, a corrected EMI double-reduces the
+        loan balance and the projection diverges silently.
+        """
+        loan_id = uuid.uuid4()
+        original = make_event(
+            event_type=EventType.EMI_PAYMENT,
+            loan_id=loan_id,
+            amount_property_currency=Decimal("50000"),
+            inr_landed=None,
+        )
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="EMI was double-recorded",
+            secret_key=secret_key,
+        )
+        original_effect = get_financial_effect(original)
+        comp_effect = get_financial_effect(comp)
+        # Bank loan deltas must sum to zero.
+        assert original_effect["bank_loan"]["delta"] == Decimal("-50000")
+        assert comp_effect["bank_loan"]["delta"] == Decimal("50000")
+        assert (
+            original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"]
+            == Decimal("0")
+        )
+        # CapEx deltas must sum to zero too.
+        assert (
+            original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"]["delta"]
+            == Decimal("0")
+        )
+        # Same loan_id and same owner_id on both sides.
+        assert comp_effect["bank_loan"]["loan_id"] == loan_id
+        assert comp_effect["owner_capex"]["owner_id"] == original.actor_owner_id
+
+    def test_bulk_prepayment_compensation_cancels_bank_loan_delta(self, make_event, secret_key):
+        """
+        Same contract as EMI_PAYMENT: a compensating BULK_PREPAYMENT must
+        cancel the original's loan-balance reduction.
+        """
+        loan_id = uuid.uuid4()
+        original = make_event(
+            event_type=EventType.BULK_PREPAYMENT,
+            loan_id=loan_id,
+            amount_property_currency=Decimal("250000"),
+            inr_landed=None,
+        )
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="Prepayment was duplicated",
+            secret_key=secret_key,
+        )
+        original_effect = get_financial_effect(original)
+        comp_effect = get_financial_effect(comp)
+        assert (
+            original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"]
+            == Decimal("0")
+        )
+
+    def test_cross_currency_contribution_compensation_cancels_inr_landed_credit(
+        self, make_event, secret_key
+    ):
+        """
+        Cross-currency CONTRIBUTION events credit owner_capex by inr_landed
+        (the dual-rate rule), NOT by amount_property_currency. Their
+        compensating entries must follow the same rule — otherwise the wire
+        fee delta (amount_property_currency - inr_landed) survives the
+        correction and accumulates over the 20-year ledger lifetime.
+        """
+        # Use the fixture defaults: amount_property_currency=415000,
+        # inr_landed=413925. The two differ; a buggy implementation would
+        # leave a -1075 residue.
+        original = make_event()
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="Wire amount entered wrong",
+            secret_key=secret_key,
+        )
+        original_effect = get_financial_effect(original)
+        comp_effect = get_financial_effect(comp)
+        # The capex deltas must sum to exactly zero — no residue.
+        assert original_effect["owner_capex"]["delta"] == Decimal("413925.00")
+        assert comp_effect["owner_capex"]["delta"] == Decimal("-413925.00")
+        assert (
+            original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"]["delta"]
+            == Decimal("0")
+        )
+
+    def test_repayment_compensation_preserves_pair_framing(self, make_event, secret_key):
+        """
+        A compensating INTERPERSONAL_LOAN_REPAYMENT must net-zero on the
+        SAME (lender, borrower) pair as the original. The previous bug:
+        the compensating entry preserved actor=borrower/target=lender from
+        the original, but then routed actor as lender — silently flipping
+        the pair direction and leaving the original repayment effect
+        un-canceled.
+        """
+        lender_id = uuid.uuid4()
+        borrower_id = uuid.uuid4()
+        original = make_event(
+            event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
+            actor_owner_id=borrower_id,
+            target_owner_id=lender_id,
+            amount_property_currency=Decimal("100000"),
+            inr_landed=None,
+        )
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="Repayment was double-counted",
+            secret_key=secret_key,
+        )
+        original_effect = get_financial_effect(original)
+        comp_effect = get_financial_effect(comp)
+        # Same pair framing on both sides.
+        assert original_effect["interpersonal"]["lender"] == lender_id
+        assert original_effect["interpersonal"]["borrower"] == borrower_id
+        assert comp_effect["interpersonal"]["lender"] == lender_id
+        assert comp_effect["interpersonal"]["borrower"] == borrower_id
+        # Net-zero on the pair.
+        assert (
+            original_effect["interpersonal"]["delta"]
+            + comp_effect["interpersonal"]["delta"]
+            == Decimal("0")
+        )
+
+    def test_settlement_compensation_preserves_pair_framing(self, make_event, secret_key):
+        """
+        A compensating SETTLEMENT must net-zero on the same (recipient,
+        payer) pair as the original. Same class of bug as REPAYMENT —
+        actor=payer/target=recipient is preserved on the compensating
+        entry, but the original's routing makes recipient the lender and
+        payer the borrower.
+        """
+        payer_id = uuid.uuid4()
+        recipient_id = uuid.uuid4()
+        original = make_event(
+            event_type=EventType.SETTLEMENT,
+            actor_owner_id=payer_id,
+            target_owner_id=recipient_id,
+            amount_property_currency=Decimal("5000"),
+            inr_landed=None,
+        )
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="Settlement was duplicated",
+            secret_key=secret_key,
+        )
+        original_effect = get_financial_effect(original)
+        comp_effect = get_financial_effect(comp)
+        assert original_effect["interpersonal"]["lender"] == recipient_id
+        assert original_effect["interpersonal"]["borrower"] == payer_id
+        assert comp_effect["interpersonal"]["lender"] == recipient_id
+        assert comp_effect["interpersonal"]["borrower"] == payer_id
+        assert (
+            original_effect["interpersonal"]["delta"]
+            + comp_effect["interpersonal"]["delta"]
+            == Decimal("0")
+        )
+
+    def test_opex_split_compensation_preserves_pair_framing(self, make_event, secret_key):
+        """
+        A compensating OPEX_SPLIT must net-zero on the same (payer,
+        share-owner) pair as the original. The original makes payer=lender
+        and share-owner=borrower; the compensating entry must keep that
+        framing.
+        """
+        payer_id = uuid.uuid4()
+        share_owner_id = uuid.uuid4()
+        original = make_event(
+            event_type=EventType.OPEX_SPLIT,
+            actor_owner_id=share_owner_id,
+            target_owner_id=payer_id,
+            amount_property_currency=Decimal("40000"),
+            inr_landed=None,
+        )
+        comp = build_compensating_entry(
+            original=original,
+            actor_email="fixer@example.com",
+            description="OpEx split row was wrong",
+            secret_key=secret_key,
+        )
+        original_effect = get_financial_effect(original)
+        comp_effect = get_financial_effect(comp)
+        assert original_effect["interpersonal"]["lender"] == payer_id
+        assert original_effect["interpersonal"]["borrower"] == share_owner_id
+        assert comp_effect["interpersonal"]["lender"] == payer_id
+        assert comp_effect["interpersonal"]["borrower"] == share_owner_id
+        assert (
+            original_effect["interpersonal"]["delta"]
+            + comp_effect["interpersonal"]["delta"]
+            == Decimal("0")
+        )
+        # owner_opex must also net to zero.
+        assert (
+            original_effect["owner_opex"]["delta"] + comp_effect["owner_opex"]["delta"]
+            == Decimal("0")
+        )
+
+    def test_compensating_entry_with_missing_metadata_returns_empty_effect(
+        self, make_event
+    ):
+        """
+        A COMPENSATING_ENTRY without `original_event_type` in metadata
+        cannot be routed. The function must return an empty effect dict
+        rather than guessing — the caller (audit UI / projection engine)
+        flags such rows for human review.
+        """
+        evt = make_event(
+            event_type=EventType.COMPENSATING_ENTRY,
+            amount_property_currency=Decimal("-100"),
+            reverses_event_id=uuid.uuid4(),
+            metadata={"reverses_original_event": "some-uuid"},  # missing original_event_type
+        )
+        assert get_financial_effect(evt) == {}
+
+
+# ---------------------------------------------------------------------------
+# Validation edge cases — same-currency CONTRIBUTION and OPEX_SPLIT actor==target
+# ---------------------------------------------------------------------------
+class TestValidateEdgeCases:
+    def test_same_currency_contribution_does_not_require_fx_rate(self, make_event):
+        """
+        A CONTRIBUTION where source_currency == property_currency is a
+        same-currency contribution (e.g., an INR-based owner contributing
+        directly to an INR-denominated property). It has no FX conversion
+        and therefore no fx_rate_actual or amount_source_currency. The
+        validator must accept it — otherwise the API would reject every
+        valid same-currency contribution at the boundary.
+        """
+        evt = make_event(
+            source_currency="INR",
+            property_currency="INR",
+            fx_rate_actual=None,
+            fx_rate_reference=None,
+            amount_source_currency=None,
+            fee_source_currency=None,
+            inr_landed=None,
+            amount_property_currency=Decimal("100000"),
+        )
+        assert validate_event_fields(evt) == []
+
+    def test_cross_currency_contribution_still_requires_fx_rate(self, make_event):
+        """
+        Cross-currency CONTRIBUTIONs continue to require fx_rate_actual.
+        The conditional fix must not weaken the cross-currency contract.
+        """
+        evt = make_event(
+            source_currency="USD",
+            property_currency="INR",
+            fx_rate_actual=None,
+            amount_source_currency=None,
+            inr_landed=None,
+            amount_property_currency=Decimal("100000"),
+        )
+        errors = validate_event_fields(evt)
+        assert any("fx_rate_actual" in e for e in errors)
+        assert any("amount_source_currency" in e for e in errors)
+
+    def test_opex_split_payer_own_share_validates_ok(self, make_event):
+        """
+        An OPEX_SPLIT row where actor == target represents the payer's own
+        share — explicitly documented as valid in event-log.md. The
+        validator must accept it; rejecting it would block recording a
+        complete set of OpEx splits.
+        """
+        owner_id = uuid.uuid4()
+        evt = make_event(
+            event_type=EventType.OPEX_SPLIT,
+            actor_owner_id=owner_id,
+            target_owner_id=owner_id,
+            amount_property_currency=Decimal("40000"),
+        )
+        assert validate_event_fields(evt) == []
+
+    def test_settlement_actor_target_must_still_differ(self, make_event):
+        """
+        Loosening the actor!=target check for OPEX_SPLIT must NOT weaken it
+        for SETTLEMENT (or REPAYMENT, DISBURSEMENT, RATE_CHANGE). A
+        settlement with actor==target is still a no-op and a likely user
+        error.
+        """
+        actor_id = uuid.uuid4()
+        evt = make_event(
+            event_type=EventType.SETTLEMENT,
+            actor_owner_id=actor_id,
+            target_owner_id=actor_id,
+            amount_property_currency=Decimal("5000"),
+        )
+        errors = validate_event_fields(evt)
+        assert any("must differ" in e for e in errors)
