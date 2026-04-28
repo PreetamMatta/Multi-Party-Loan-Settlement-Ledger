@@ -434,11 +434,14 @@ class TestFinancialEffect:
         assert effect["interpersonal"]["borrower"] == payer_id
         assert effect["interpersonal"]["delta"] == Decimal("-5000")
 
-    def test_emi_payment_reduces_loan_principal(self, make_event):
+    def test_emi_payment_reduces_loan_principal_by_principal_component_only(self, make_event):
         """
-        EMI_PAYMENT must reduce the loan's principal by the gross amount
-        and credit the payer's CapEx. (The principal/interest split is
-        applied in metadata downstream; here we model the gross movement.)
+        EMI_PAYMENT must reduce the loan's principal by the EMI's
+        principal_component (from metadata), NOT by the gross amount.
+        Likewise the payer's CapEx grows by the principal portion only —
+        the interest portion is the bank's revenue and has zero balance
+        effect. Routing the gross amount would over-credit CapEx and
+        over-reduce principal on every amortizing payment.
         """
         loan_id = uuid.uuid4()
         evt = make_event(
@@ -446,11 +449,34 @@ class TestFinancialEffect:
             loan_id=loan_id,
             amount_property_currency=Decimal("50000"),
             inr_landed=None,
+            metadata={
+                "principal_component": Decimal("35000"),
+                "interest_component": Decimal("15000"),
+                "emi_schedule_id": str(uuid.uuid4()),
+            },
         )
         effect = get_financial_effect(evt)
         assert effect["bank_loan"]["loan_id"] == loan_id
-        assert effect["bank_loan"]["delta"] == Decimal("-50000")
-        assert effect["owner_capex"]["delta"] == Decimal("50000")
+        assert effect["bank_loan"]["delta"] == Decimal("-35000")
+        assert effect["owner_capex"]["delta"] == Decimal("35000")
+
+    def test_emi_payment_without_principal_component_returns_empty_effect(self, make_event):
+        """
+        An EMI_PAYMENT event missing metadata.principal_component is
+        malformed (validation should have caught it). The router must NOT
+        guess by falling back to the gross amount — that's the bug this
+        whole change fixes. Returning an empty effect dict surfaces the
+        problem to the projection engine and the audit UI.
+        """
+        loan_id = uuid.uuid4()
+        evt = make_event(
+            event_type=EventType.EMI_PAYMENT,
+            loan_id=loan_id,
+            amount_property_currency=Decimal("50000"),
+            inr_landed=None,
+            metadata={},  # principal_component missing
+        )
+        assert get_financial_effect(evt) == {}
 
     def test_compensating_entry_negates_parent_effect(self, make_event, secret_key):
         """
@@ -547,13 +573,14 @@ class TestFinancialEffect:
 #   3. lender/borrower inversion on REPAYMENT/SETTLEMENT compensations
 #   4. lender/borrower inversion on OPEX_SPLIT compensations
 class TestCompensatingEntryRouting:
-    def test_emi_payment_compensation_cancels_bank_loan_delta(self, make_event, secret_key):
+    def test_emi_payment_compensation_cancels_principal_only(self, make_event, secret_key):
         """
-        Compensating an EMI_PAYMENT must produce a bank_loan delta that
-        exactly cancels the original. The original reduces principal
-        (negative delta); the compensating entry must INCREASE principal
-        (positive delta). Without this, a corrected EMI double-reduces the
-        loan balance and the projection diverges silently.
+        Compensating an EMI_PAYMENT must cancel the principal-portion effect
+        on both bank_loan and owner_capex. The compensating entry inherits
+        principal_component from metadata (negated by build_compensating_entry),
+        so its bank_loan delta is +principal and owner_capex delta is
+        -principal. The interest component never affected balances, so
+        there is nothing to cancel there.
         """
         loan_id = uuid.uuid4()
         original = make_event(
@@ -561,6 +588,11 @@ class TestCompensatingEntryRouting:
             loan_id=loan_id,
             amount_property_currency=Decimal("50000"),
             inr_landed=None,
+            metadata={
+                "principal_component": Decimal("35000"),
+                "interest_component": Decimal("15000"),
+                "emi_schedule_id": str(uuid.uuid4()),
+            },
         )
         comp = build_compensating_entry(
             original=original,
@@ -570,19 +602,22 @@ class TestCompensatingEntryRouting:
         )
         original_effect = get_financial_effect(original)
         comp_effect = get_financial_effect(comp)
-        # Bank loan deltas must sum to zero.
-        assert original_effect["bank_loan"]["delta"] == Decimal("-50000")
-        assert comp_effect["bank_loan"]["delta"] == Decimal("50000")
+        # Bank loan: -35000 (original) + +35000 (compensating) = 0.
+        assert original_effect["bank_loan"]["delta"] == Decimal("-35000")
+        assert comp_effect["bank_loan"]["delta"] == Decimal("35000")
         assert original_effect["bank_loan"]["delta"] + comp_effect["bank_loan"]["delta"] == Decimal(
             "0"
         )
-        # CapEx deltas must sum to zero too.
+        # CapEx: +35000 (original) + -35000 (compensating) = 0.
         assert original_effect["owner_capex"]["delta"] + comp_effect["owner_capex"][
             "delta"
         ] == Decimal("0")
-        # Same loan_id and same owner_id on both sides.
         assert comp_effect["bank_loan"]["loan_id"] == loan_id
         assert comp_effect["owner_capex"]["owner_id"] == original.actor_owner_id
+        # The compensating entry's principal_component must be the negation
+        # of the original's so the routing produces the cancellation.
+        assert comp.metadata["principal_component"] == Decimal("-35000")
+        assert comp.metadata["interest_component"] == Decimal("-15000")
 
     def test_bulk_prepayment_compensation_cancels_bank_loan_delta(self, make_event, secret_key):
         """
@@ -815,6 +850,93 @@ class TestValidateEdgeCases:
             amount_property_currency=Decimal("40000"),
         )
         assert validate_event_fields(evt) == []
+
+    def test_emi_payment_requires_principal_and_interest_components(self, make_event):
+        """
+        EMI_PAYMENT validation must require metadata.principal_component and
+        metadata.interest_component. Missing either makes the routing
+        engine unable to credit only the principal portion to CapEx and
+        loan-principal reduction — the very class of bug this whole
+        change fixes.
+        """
+        loan_id = uuid.uuid4()
+        evt = make_event(
+            event_type=EventType.EMI_PAYMENT,
+            loan_id=loan_id,
+            amount_property_currency=Decimal("50000"),
+            metadata={},  # neither principal_component nor interest_component
+        )
+        errors = validate_event_fields(evt)
+        assert any("principal_component" in e for e in errors)
+        assert any("interest_component" in e for e in errors)
+
+    def test_cross_currency_emi_payment_requires_fx_rate(self, make_event):
+        """
+        A USD-resident owner paying an INR EMI is a cross-currency EMI and
+        must carry the dual-rate stamp — same contract as cross-currency
+        CONTRIBUTION. Skipping this validation lets cross-currency EMIs be
+        persisted without the FX context the rest of the system treats as
+        authoritative.
+        """
+        evt = make_event(
+            event_type=EventType.EMI_PAYMENT,
+            loan_id=uuid.uuid4(),
+            source_currency="USD",
+            property_currency="INR",
+            fx_rate_actual=None,
+            amount_source_currency=None,
+            amount_property_currency=Decimal("50000"),
+            metadata={
+                "principal_component": Decimal("35000"),
+                "interest_component": Decimal("15000"),
+                "emi_schedule_id": str(uuid.uuid4()),
+            },
+        )
+        errors = validate_event_fields(evt)
+        assert any("fx_rate_actual" in e for e in errors)
+        assert any("amount_source_currency" in e for e in errors)
+
+    def test_same_currency_emi_payment_does_not_require_fx_rate(self, make_event):
+        """
+        An INR-resident owner paying an INR EMI has no FX conversion. The
+        validator must accept the same-currency case without FX fields.
+        """
+        evt = make_event(
+            event_type=EventType.EMI_PAYMENT,
+            loan_id=uuid.uuid4(),
+            source_currency="INR",
+            property_currency="INR",
+            fx_rate_actual=None,
+            fx_rate_reference=None,
+            amount_source_currency=None,
+            fee_source_currency=None,
+            inr_landed=None,
+            amount_property_currency=Decimal("50000"),
+            metadata={
+                "principal_component": Decimal("35000"),
+                "interest_component": Decimal("15000"),
+                "emi_schedule_id": str(uuid.uuid4()),
+            },
+        )
+        assert validate_event_fields(evt) == []
+
+    def test_cross_currency_bulk_prepayment_requires_fx_rate(self, make_event):
+        """
+        Same cross-currency rule applies to BULK_PREPAYMENT: a USD owner
+        prepaying an INR loan must carry the FX stamp.
+        """
+        evt = make_event(
+            event_type=EventType.BULK_PREPAYMENT,
+            loan_id=uuid.uuid4(),
+            source_currency="USD",
+            property_currency="INR",
+            fx_rate_actual=None,
+            amount_source_currency=None,
+            amount_property_currency=Decimal("250000"),
+        )
+        errors = validate_event_fields(evt)
+        assert any("fx_rate_actual" in e for e in errors)
+        assert any("amount_source_currency" in e for e in errors)
 
     def test_settlement_actor_target_must_still_differ(self, make_event):
         """

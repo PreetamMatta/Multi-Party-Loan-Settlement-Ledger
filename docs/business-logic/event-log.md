@@ -72,14 +72,25 @@ deposits used to fund the property.
   inter-personal loan). Does *not* directly reduce a bank loan unless the
   contribution is specifically routed to one — that's an `EMI_PAYMENT` or
   `BULK_PREPAYMENT`.
-- **Expected fields:** `amount_source_currency`, `source_currency`,
-  `amount_property_currency`, `fx_rate_actual`, `fx_rate_reference`,
-  `fee_source_currency`, `inr_landed`, `effective_date`, `description`.
-- **Example:** *"V wires $5,000 USD to the property's INR account on
-  2026-05-01. The bank applies 83.20 INR/USD; mid-market reference is 83.45.
-  Wire fee is $25. Recorded as a CONTRIBUTION with
-  amount_source_currency=$5,000, fee_source_currency=$25, fx_rate_actual=83.20,
-  fx_rate_reference=83.45, inr_landed=$4,975 × 83.20 = ₹413,920."*
+- **Expected fields:**
+  - Always: `amount_property_currency`, `effective_date`, `description`,
+    `source_currency`, `property_currency`.
+  - **Cross-currency only** (when `source_currency != property_currency`):
+    `amount_source_currency`, `fx_rate_actual`, `fx_rate_reference`,
+    `fee_source_currency`, `inr_landed` — the full dual-rate stamp.
+  - **Same-currency** (e.g., an INR-resident owner contributing to an
+    INR-denominated property): the FX fields are not applicable and are
+    omitted; the credit is `amount_property_currency` directly.
+- **Example (cross-currency):** *"V wires $5,000 USD to the property's INR
+  account on 2026-05-01. The bank applies 83.20 INR/USD; mid-market
+  reference is 83.45. Wire fee is $25. Recorded as a CONTRIBUTION with
+  amount_source_currency=$5,000, fee_source_currency=$25,
+  fx_rate_actual=83.20, fx_rate_reference=83.45, inr_landed=$4,975 ×
+  83.20 = ₹413,920."*
+- **Example (same-currency):** *"P, an INR-resident owner, contributes
+  ₹100,000 directly from their INR savings on 2026-06-01. Recorded as
+  CONTRIBUTION, amount_property_currency=₹100,000, source_currency='INR',
+  property_currency='INR', no FX fields."*
 
 ### `EMI_PAYMENT`
 
@@ -91,17 +102,34 @@ outstanding principal (by the principal component of that EMI only).
 - **`target_owner_id`** — `NULL` (paid to the bank).
 - **`loan_id`** — required: which bank loan this EMI services.
 - **Financial effect:** Reduces the loan's outstanding principal by the EMI's
-  principal component (the interest component does not reduce principal —
-  that goes to the bank as carrying cost). Increases the actor's CapEx
-  contribution total by the principal portion.
-- **Expected fields:** `loan_id`, `amount_property_currency`,
-  `fx_rate_actual` (if cross-currency), `effective_date`, plus a `metadata`
-  payload identifying which `emi_schedule.id` row was paid.
+  **principal component only** (the interest component does not reduce
+  principal — that goes to the bank as carrying cost). Increases the actor's
+  CapEx contribution total by the **principal portion only**. Routing the
+  gross EMI amount (principal + interest) instead would over-credit the
+  payer's CapEx and over-reduce the loan's principal on every amortizing
+  payment, so the principal split is mandatory data, not optional metadata.
+- **Expected fields:**
+  - `loan_id` (required), `amount_property_currency` (gross EMI),
+    `effective_date`.
+  - `metadata.principal_component` (Decimal, in property currency) — required.
+  - `metadata.interest_component` (Decimal) — required for completeness;
+    the routing engine ignores it (interest does not move our balances)
+    but the audit / reporting layers need it.
+  - `metadata.emi_schedule_id` — required: links to the `emi_schedule` row
+    that was paid.
+  - **Cross-currency:** if `source_currency != property_currency`, also
+    populate `fx_rate_actual`, `fx_rate_reference`, `amount_source_currency`,
+    `fee_source_currency`, and `inr_landed` (per the dual-rate stamping
+    rule — see `fx-and-wire-transfers.md`). Same-currency EMIs (an INR
+    owner paying an INR-denominated bank loan) need none of the FX
+    fields.
 - **Example:** *"P pays the May EMI of ₹50,000 (₹35,000 principal + ₹15,000
   interest) directly to HDFC for Loan #1 on 2026-05-15. Recorded as
-  EMI_PAYMENT, loan_id=Loan#1, amount_property_currency=₹50,000, with
-  metadata containing the principal/interest split and the
-  emi_schedule.id."*
+  EMI_PAYMENT, loan_id=Loan#1, amount_property_currency=₹50,000,
+  metadata={principal_component: 35000, interest_component: 15000,
+  emi_schedule_id: <uuid>}. Loan #1's principal is reduced by ₹35,000; P's
+  CapEx total grows by ₹35,000; the ₹15,000 interest is a no-op for our
+  balances (the bank's revenue, not P's contribution to the asset)."*
 
 ### `BULK_PREPAYMENT`
 
@@ -113,8 +141,13 @@ like `EMI_PAYMENT` but is unscheduled and goes 100% to principal.
 - **`loan_id`** — required.
 - **Financial effect:** Reduces the loan's outstanding principal by the full
   amount. Increases the actor's CapEx contribution total by the full amount.
-- **Expected fields:** Same as `EMI_PAYMENT`. No principal/interest split
-  needed (it's all principal).
+  No principal/interest split because there is no interest portion — the
+  whole payment is principal.
+- **Expected fields:** Same as `EMI_PAYMENT` *except*
+  `metadata.principal_component` and `metadata.interest_component` are
+  not used (the gross `amount_property_currency` is the principal). Same
+  cross-currency rule applies: if `source_currency != property_currency`,
+  populate the dual-rate FX fields.
 - **Example:** *"V receives a bonus and prepays ₹500,000 on Loan #1 on
   2026-12-01. Recorded as BULK_PREPAYMENT, loan_id=Loan#1,
   amount_property_currency=₹500,000."*

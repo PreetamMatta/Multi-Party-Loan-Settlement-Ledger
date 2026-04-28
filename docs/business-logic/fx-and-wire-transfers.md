@@ -176,12 +176,38 @@ record what arrived.
 
 ## The reference rate fetch process
 
+### The `fx_rates` table is the source of truth
+
+> **All read-time lookups go through the `fx_rates` table — never the live
+> API.** The live API is used by exactly one job (the daily populator);
+> every other code path reads from the database. This is the rule that
+> keeps historical lookups deterministic and reproducible: given the same
+> `(date, pair)`, the answer is always the same, regardless of when or
+> how many times the question is asked.
+
+Why this matters: a balance computation is just an event replay over the
+log. If a re-replay run on a different day pulled fresh rates from a live
+API, the same query for "balance as of date X" could yield different
+answers across runs — silently. That breaks audit and reconciliation.
+With the table as source of truth, "balance as of date X" is a pure
+function of the rows in the database.
+
 ### How daily reference rates are populated
 
-A daily automated job hits `exchangerate.host` for `USD_INR` (and any
-other configured pairs) and writes a row to the `fx_rates` table. This is
-the source of truth for `fx_rate_reference` on any given date. The job
-runs once per day in the property's home timezone.
+A daily automated job (Session 8) hits `exchangerate.host` for `USD_INR`
+(and any other configured pairs) and writes a row to the `fx_rates` table.
+The job runs once per day in the property's home timezone.
+
+In code, this is a **separate function** from the read-time lookup:
+
+| Function | Purpose | Calls live API? | Writes DB? |
+|----------|---------|-----------------|------------|
+| `fetch_reference_rate(date, pair, store)` | Read-time lookup. Returns the stored rate for the date, or the most recent prior stored rate. | No | No |
+| `fetch_reference_rate_from_api(date, pair, http_client)` | The cron's helper. Fetches from `exchangerate.host`. The cron writes the result into `fx_rates`. | Yes | No (the cron writes) |
+
+Read-time callers must never invoke the API directly. The contract is
+strict: the only writer to `fx_rates` is the daily populator job. Any
+other code that needs a rate calls `fetch_reference_rate`.
 
 ### How actual wire rates are populated
 
@@ -193,10 +219,10 @@ the bank executed.
 
 ### When the reference rate is missing
 
-If a cross-currency event is logged for a date for which no `fx_rates` row
-exists (e.g., the daily snapshot job failed, or the date is in the future
-of the last snapshot, or the date is a holiday and the FX provider didn't
-publish a rate):
+If a cross-currency event is logged for a date for which no exact
+`fx_rates` row exists (e.g., the daily snapshot job failed, or the date
+is in the future of the last snapshot, or the date is a holiday and the
+FX provider didn't publish a rate):
 
 1. The application falls back to the **most recent available reference
    rate** for that currency pair (the latest `rate_date` ≤ requested

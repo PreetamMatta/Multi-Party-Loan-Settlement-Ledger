@@ -194,6 +194,21 @@ def build_compensating_entry(
     else:
         inr_landed_negated = -original.inr_landed
 
+    # Inherit the original's metadata so per-type routing details (e.g., the
+    # principal/interest split on an EMI_PAYMENT) are available when we
+    # dispatch the compensating entry through the parent's routing path.
+    # Quantity-like fields are negated; identity-like fields are preserved.
+    inherited_metadata: dict[str, Any] = dict(original.metadata)
+    for key in ("principal_component", "interest_component"):
+        if key in inherited_metadata and inherited_metadata[key] is not None:
+            inherited_metadata[key] = -Decimal(str(inherited_metadata[key]))
+    inherited_metadata["reverses_original_event"] = str(original.id)
+    # Stored so get_financial_effect can dispatch through the parent's
+    # routing path: the compensating entry's amounts/inr_landed/principal
+    # component are already negated, so running them through the parent's
+    # logic produces a clean negation in the parent's framing.
+    inherited_metadata["original_event_type"] = original.event_type.value
+
     compensating = LedgerEvent(
         property_id=original.property_id,
         event_type=EventType.COMPENSATING_ENTRY,
@@ -209,15 +224,7 @@ def build_compensating_entry(
         fee_source_currency=original.fee_source_currency,
         inr_landed=inr_landed_negated,
         description=description,
-        metadata={
-            "reverses_original_event": str(original.id),
-            # Stored so get_financial_effect can dispatch through the parent's
-            # routing path: the compensating entry's amounts/inr_landed are
-            # already negated, so running them through the parent's logic
-            # produces a clean negation in the parent's framing (lender/borrower,
-            # bank_loan sign, etc.).
-            "original_event_type": original.event_type.value,
-        },
+        metadata=inherited_metadata,
         reverses_event_id=original.id,
         recorded_by=actor_email,
         effective_date=original.effective_date,
@@ -267,13 +274,18 @@ def validate_event_fields(event: LedgerEvent) -> list[str]:
     if et in needs_amount and event.amount_property_currency is None:
         errors.append(f"{et.value}: amount_property_currency is required.")
 
-    # Cross-currency CONTRIBUTION events require the dual-rate stamp.
-    # Same-currency contributions (e.g., an INR-based owner contributing to
-    # an INR-denominated property) have no FX conversion and therefore no
-    # fx_rate_actual or amount_source_currency. We only require those fields
-    # when source_currency != property_currency. See docs/business-logic/
-    # event-log.md for the CONTRIBUTION contract.
-    if et is EventType.CONTRIBUTION:
+    # Cross-currency money-in events require the dual-rate stamp.
+    # Same-currency variants (e.g., an INR owner contributing to an INR
+    # property, or paying an INR EMI) have no FX conversion and the FX
+    # fields are simply omitted. CONTRIBUTION, EMI_PAYMENT, and
+    # BULK_PREPAYMENT all share this contract — see
+    # docs/business-logic/event-log.md and fx-and-wire-transfers.md.
+    cross_currency_eligible = {
+        EventType.CONTRIBUTION,
+        EventType.EMI_PAYMENT,
+        EventType.BULK_PREPAYMENT,
+    }
+    if et in cross_currency_eligible:
         is_cross_currency = (
             event.source_currency is not None
             and event.property_currency is not None
@@ -282,10 +294,21 @@ def validate_event_fields(event: LedgerEvent) -> list[str]:
         if is_cross_currency:
             if event.fx_rate_actual is None:
                 errors.append(
-                    "CONTRIBUTION: fx_rate_actual is required for cross-currency stamping."
+                    f"{et.value}: fx_rate_actual is required for cross-currency stamping."
                 )
             if event.amount_source_currency is None:
-                errors.append("CONTRIBUTION: amount_source_currency is required.")
+                errors.append(f"{et.value}: amount_source_currency is required.")
+
+    # EMI_PAYMENT carries an amortization split. The principal portion drives
+    # both the bank loan reduction and the actor's CapEx credit; the interest
+    # portion is the bank's revenue and has no balance effect. Both must be
+    # populated in metadata so the routing engine can correctly avoid
+    # over-crediting CapEx and over-reducing principal.
+    if et is EventType.EMI_PAYMENT:
+        if "principal_component" not in event.metadata:
+            errors.append("EMI_PAYMENT: metadata.principal_component is required.")
+        if "interest_component" not in event.metadata:
+            errors.append("EMI_PAYMENT: metadata.interest_component is required.")
 
     # Inter-personal events require a target (the counterparty).
     pair_required = {
@@ -419,6 +442,21 @@ def get_financial_effect(event: LedgerEvent) -> dict[str, Any]:
     return _route_by_type(event.event_type, event)
 
 
+def _decimal_from_metadata(metadata: dict[str, Any], key: str) -> Decimal | None:
+    """
+    Coerce a metadata field to Decimal. Returns None if the key is absent or
+    the value is None. Tolerant of values stored as Decimal, int, or string —
+    JSONB round-trips can return any of those depending on how the row was
+    written.
+    """
+    raw = metadata.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, Decimal):
+        return raw
+    return Decimal(str(raw))
+
+
 def _route_by_type(logical_type: EventType, event: LedgerEvent) -> dict[str, Any]:
     """
     Apply the routing for a given logical event type using the field values on
@@ -441,14 +479,19 @@ def _route_by_type(logical_type: EventType, event: LedgerEvent) -> dict[str, Any
         return effect
 
     if logical_type is EventType.EMI_PAYMENT:
-        # The payer's CapEx grows by the principal portion paid (passed via
-        # metadata) — but routing the principal/interest split is the
-        # caller's job. Here we credit the gross amount to capex; balance.py
-        # consults metadata for the principal-only portion.
-        if amount is not None:
-            effect["owner_capex"] = {"owner_id": event.actor_owner_id, "delta": amount}
-        if event.loan_id is not None and amount is not None:
-            effect["bank_loan"] = {"loan_id": event.loan_id, "delta": -amount}
+        # An EMI is amortizing: only the principal component reduces the loan
+        # balance and counts toward the actor's CapEx contribution. The
+        # interest component is the bank's revenue and has zero balance
+        # effect. Routing the gross amount instead would over-credit the
+        # payer and over-reduce principal on every payment — at scale, that
+        # is a meaningful and silent divergence. The principal/interest
+        # split is required in metadata (see validate_event_fields).
+        principal = _decimal_from_metadata(event.metadata, "principal_component")
+        if principal is None:
+            return effect
+        effect["owner_capex"] = {"owner_id": event.actor_owner_id, "delta": principal}
+        if event.loan_id is not None:
+            effect["bank_loan"] = {"loan_id": event.loan_id, "delta": -principal}
         return effect
 
     if logical_type is EventType.BULK_PREPAYMENT:

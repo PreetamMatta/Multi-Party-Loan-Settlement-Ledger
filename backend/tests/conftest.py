@@ -51,6 +51,18 @@ def make_event():
     """
 
     def _factory(**overrides: Any) -> LedgerEvent:
+        event_type = overrides.get("event_type", EventType.CONTRIBUTION)
+        # EMI_PAYMENT carries an amortization split in metadata. The factory
+        # fills in a sensible default so callers don't have to supply it for
+        # every EMI test; explicit `metadata=` overrides win.
+        default_metadata: dict[str, Any] = {}
+        if event_type is EventType.EMI_PAYMENT:
+            default_metadata = {
+                "principal_component": Decimal("35000.00"),
+                "interest_component": Decimal("15000.00"),
+                "emi_schedule_id": str(uuid.uuid4()),
+            }
+
         defaults: dict[str, Any] = {
             "property_id": uuid.uuid4(),
             "event_type": EventType.CONTRIBUTION,
@@ -66,7 +78,7 @@ def make_event():
             "fee_source_currency": Decimal("25.00"),
             "inr_landed": Decimal("413925.00"),
             "description": "Test event",
-            "metadata": {},
+            "metadata": default_metadata,
             "reverses_event_id": None,
             "hmac_signature": None,
             "recorded_by": "tester@example.com",
