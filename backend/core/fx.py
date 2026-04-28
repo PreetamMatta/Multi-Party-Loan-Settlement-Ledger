@@ -14,13 +14,34 @@ The credit to the sender's balance = inr_landed (not amount_source * rate).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from typing import Any, Protocol
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+EXCHANGERATE_HOST_BASE = "https://api.exchangerate.host"
 
 
 class FXRateNotFoundError(Exception):
     """Raised when no reference rate is available for a (date, pair)."""
+
+
+class FXRateFallbackStore(Protocol):
+    """
+    Minimal interface the fallback database lookup must satisfy. Lets us
+    inject a fake in tests without dragging asyncpg or SQLAlchemy in. The
+    real implementation against the database is wired in Session 3 / 4.
+    """
+
+    async def get_latest_reference_rate_on_or_before(
+        self, on_or_before: date, currency_pair: str
+    ) -> tuple[date, Decimal] | None:
+        ...
 
 
 @dataclass(frozen=True)
@@ -96,25 +117,115 @@ def stamp_fx_event(
     )
 
 
+def _parse_pair(pair: str) -> tuple[str, str]:
+    """
+    Split an internal pair token like 'USD_INR' into (base, quote).
+
+    The internal canonical format is 'BASE_QUOTE' (e.g., 'USD_INR'); the
+    external API expects them as separate `base=`/`symbols=` query params.
+    """
+    if "_" not in pair:
+        raise ValueError(f"Invalid currency pair token: {pair!r} (expected 'BASE_QUOTE').")
+    base, quote = pair.split("_", 1)
+    return base, quote
+
+
 async def fetch_reference_rate(
     rate_date: date,
     pair: str = "USD_INR",
-    db: object | None = None,
+    fallback_store: FXRateFallbackStore | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> Decimal:
     """
-    Look up the reference rate for a given date and currency pair.
+    Look up the mid-market reference rate for a (date, pair).
 
-    Returns the `reference_rate` from the `fx_rates` table.
+    Resolution order:
+      1. Hit exchangerate.host for the requested date.
+      2. On any failure (network error, non-200, missing field) fall back to
+         the most recent reference rate stored for this pair on or before
+         `rate_date` via `fallback_store`.
+      3. If no fallback exists either, raise `FXRateNotFoundError`.
 
-    Raises:
-        FXRateNotFoundError: if no row exists for (rate_date, pair).
+    A `WARNING` is emitted with structured fields whenever the fallback path
+    is used, so the audit trail records exactly which date's rate was
+    substituted. See docs/business-logic/fx-and-wire-transfers.md for the
+    full rationale.
 
-    TODO Session 3: implement against asyncpg / SQLAlchemy session.
-        - Query: SELECT reference_rate FROM fx_rates
-                 WHERE rate_date = $1 AND currency_pair = $2 LIMIT 1;
-        - On miss: log a warning and raise FXRateNotFoundError.
-        - Wire up the daily exchangerate.host snapshot job (separate cron).
+    Note: The Session 8 daily-snapshot cron job will call this same function
+    to populate the `fx_rates` table; that job is the producer, this function
+    serves both the producer and read-time callers.
+
+    TODO Session 8: wire up the daily cron that pre-populates fx_rates so the
+        fallback path is rarely hit during normal operation.
     """
-    raise NotImplementedError(
-        "TODO Session 3: implement reference rate lookup against fx_rates table"
+    base, quote = _parse_pair(pair)
+
+    rate = await _fetch_from_exchangerate_host(rate_date, base, quote, http_client)
+    if rate is not None:
+        return rate
+
+    # API failed — try the fallback store.
+    if fallback_store is not None:
+        fallback = await fallback_store.get_latest_reference_rate_on_or_before(
+            on_or_before=rate_date, currency_pair=pair
+        )
+        if fallback is not None:
+            fallback_date, fallback_rate = fallback
+            logger.warning(
+                "fx_rate_fallback",
+                extra={
+                    "event": "fx_rate_fallback",
+                    "requested_date": rate_date.isoformat(),
+                    "fallback_date": fallback_date.isoformat(),
+                    "pair": pair,
+                },
+            )
+            return fallback_rate
+
+    raise FXRateNotFoundError(
+        f"No reference rate available for {pair} on or before {rate_date.isoformat()}; "
+        "API call failed and no fallback rate exists in the store."
     )
+
+
+async def _fetch_from_exchangerate_host(
+    rate_date: date,
+    base: str,
+    quote: str,
+    http_client: httpx.AsyncClient | None,
+) -> Decimal | None:
+    """
+    Single attempt at the live API. Returns None on any failure (network,
+    non-200, missing field, parse error). Never raises — the caller decides
+    whether to fall back or surface the error.
+    """
+    url = f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}"
+    params = {"base": base, "symbols": quote}
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=10.0)
+    try:
+        try:
+            response = await client.get(url, params=params)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            payload: dict[str, Any] = response.json()
+        except ValueError:
+            return None
+        rates = payload.get("rates")
+        if not isinstance(rates, dict):
+            return None
+        raw = rates.get(quote)
+        if raw is None:
+            return None
+        # str() round-trip avoids float→Decimal precision drift if the API
+        # returned a JSON number that parsed as a Python float.
+        try:
+            return Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            return None
+    finally:
+        if owns_client:
+            await client.aclose()

@@ -96,14 +96,34 @@ These are hard constraints. Violations require an explicit migration discussion 
 
 ```
 Session 1 — Scaffold, docs, schema, backend foundation       ← COMPLETE
-Session 2 — Event log full implementation + HMAC tests       ← NEXT
-Session 3 — Balance projection engine, FX module, computed views
+Session 2 — Business logic docs, event log impl + HMAC tests, FX fetcher  ← COMPLETE
+Session 3 — Balance projection engine, computed views        ← NEXT
 Session 4 — FastAPI endpoints (contribution, payment, settlement, FX)
 Session 5 — FastMCP tool surface implementation
 Session 6 — Exit scenario calculator, per-FY interest statements
 Session 7 — Frontend (Next.js, TanStack Table, Recharts dashboard)
 Session 8 — Docker prod config, nightly export, Git sync cron
 ```
+
+## Key Documented Decisions
+
+The authoritative business-logic reference now lives under `docs/business-logic/`.
+When changing behavior, update the relevant document FIRST, then the code.
+
+- `docs/business-logic/README.md` — index and how to use these docs.
+- `docs/business-logic/event-log.md` — full event-type taxonomy (13 types, each with
+  worked example), HMAC canonical string contract, compensating-entry mechanics,
+  `effective_date` vs `recorded_at` distinction.
+- `docs/business-logic/fx-and-wire-transfers.md` — dual-rate stamping math,
+  wire-fee rules (sender's cost, never socialized), FX gain/loss reporting,
+  reference-rate fallback policy.
+- `docs/business-logic/interpersonal-loans.md` — simple-interest accrual on
+  actual/365, forward-only rate changes, per-FY statement shape, balance
+  computation algorithm.
+- `docs/business-logic/balances-and-equity.md` — equity vs balance distinction,
+  projection model rationale, one-time t=0 equity-adjustment rules.
+- `docs/business-logic/exit-scenarios.md` — three buyout numbers, shared-floor
+  election, what the calculator does NOT do.
 
 ## File Ownership & Update Rules
 
@@ -128,3 +148,4 @@ docs/decisions/*.md          — One ADR per architectural decision. Append-only
 - **Do not overwrite `docs/HOUSE_CONTEXT.md` without being explicitly asked.** It is the canonical reference.
 - **Do not edit or delete event log rows.** Corrections are compensating entries.
 - **Do not introduce floats, ENUM types, or vendor-specific features** silently.
+- **Do not change the interest accrual method** (simple vs compound, actual/365 vs actual/360, etc.) without updating `docs/business-logic/interpersonal-loans.md` first AND getting explicit human confirmation. The current contract is simple interest on actual/365 — changing it silently shifts every prior balance.
