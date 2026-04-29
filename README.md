@@ -1,5 +1,7 @@
 # Multi-Party Loan & Settlement Ledger
 
+![Backend CI](https://github.com/PreetamMatta/Multi-Party-Loan-Settlement-Ledger/actions/workflows/backend-ci.yml/badge.svg)
+
 > ⚠️ **Keep this file current.** Update the directory tree, quickstart steps, and environment variable list
 > whenever they change. Outdated READMEs mislead contributors and future AI sessions alike.
 
@@ -58,8 +60,15 @@ Any group of N co-owners — siblings, cousins, friends, partners — who:
 ├── .agents/
 │   └── AGENTS.md                      # cold-start memory for AI coding sessions
 ├── docs/
-│   ├── HOUSE_CONTEXT.md               # canonical business logic reference
+│   ├── HOUSE_CONTEXT.md               # the original story (three cousins) that motivated the project
 │   ├── ERD.md                         # placeholder — added after schema finalized
+│   ├── business-logic/                # authoritative business-logic reference (read this!)
+│   │   ├── README.md                  # index and contributor guide
+│   │   ├── event-log.md               # event taxonomy, HMAC, compensating entries
+│   │   ├── fx-and-wire-transfers.md   # dual-rate FX, wire fees, gain/loss
+│   │   ├── interpersonal-loans.md     # interest model, rate changes, FY statements
+│   │   ├── balances-and-equity.md     # equity vs balance, projection model
+│   │   └── exit-scenarios.md          # three buyout numbers, shared-floor election
 │   └── decisions/                     # Architecture Decision Records (ADRs)
 ├── backend/
 │   ├── README.md
@@ -72,10 +81,11 @@ Any group of N co-owners — siblings, cousins, friends, partners — who:
 │   │   └── migrations/
 │   │       └── README.md              # human-review migration policy
 │   ├── core/
-│   │   ├── events.py                  # event model + HMAC (implemented)
-│   │   ├── fx.py                      # dual-rate FX utilities (implemented)
+│   │   ├── events.py                  # event model + HMAC + validation + financial-effect routing
+│   │   ├── fx.py                      # dual-rate FX stamping + reference-rate fetch with fallback
 │   │   ├── balance.py                 # balance projection engine (Session 3)
 │   │   └── interest.py                # interpersonal interest accrual (Session 3/6)
+│   ├── tests/                         # pytest suite (test_events, test_fx, test_fx_fetcher)
 │   ├── api/
 │   │   ├── app.py                     # FastAPI app factory
 │   │   ├── dependencies.py            # DB + auth dependencies
@@ -110,6 +120,21 @@ docker compose up -d
 # To reset the database:
 docker compose down -v && docker compose up -d
 ```
+
+## Business logic
+
+The authoritative reference for *how the ledger thinks* lives under
+[`docs/business-logic/`](docs/business-logic/). The code in `backend/core/`
+implements these contracts; if the two ever disagree, the docs are right and
+the code needs fixing.
+
+| Document | What it covers |
+|----------|----------------|
+| [event-log.md](docs/business-logic/event-log.md) | All 13 event types with worked examples, HMAC canonical-string contract, compensating-entry mechanics, `effective_date` vs `recorded_at`. |
+| [fx-and-wire-transfers.md](docs/business-logic/fx-and-wire-transfers.md) | The dual-rate FX system: actual rate drives balance math, reference rate drives FX gain/loss reporting. Wire fees are the sender's cost. |
+| [interpersonal-loans.md](docs/business-logic/interpersonal-loans.md) | Forward-only rate changes, simple-interest actual/365 accrual, per-financial-year statement shape, balance computation algorithm. |
+| [balances-and-equity.md](docs/business-logic/balances-and-equity.md) | Equity is fixed at setup; balances are projections. The one-time t=0 floor-premium adjustment is the only equity exception. |
+| [exit-scenarios.md](docs/business-logic/exit-scenarios.md) | Three buyout numbers (net contribution, market-value share, weighted blend), shared-floor election, hard limits on what the calculator does. |
 
 ## Key design decisions
 

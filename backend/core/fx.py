@@ -10,17 +10,54 @@ with two rates:
 
 Wire fees are the sender's cost and are never socialized.
 The credit to the sender's balance = inr_landed (not amount_source * rate).
+
+Read-time vs populate-time (see docs/business-logic/fx-and-wire-transfers.md):
+
+  - The `fx_rates` table is the system's source of truth for read-time
+    reference rate lookups. `fetch_reference_rate` reads from the store ONLY,
+    so the same (date, pair) query always returns the same answer regardless
+    of when it is asked. This is what makes historical balance replays
+    reproducible.
+
+  - The live API (`fetch_reference_rate_from_api`) is invoked by exactly one
+    job: the daily populator cron (Session 8). The cron writes the result
+    into `fx_rates`. No other code path calls the live API.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from typing import Any, Protocol
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+EXCHANGERATE_HOST_BASE = "https://api.exchangerate.host"
 
 
 class FXRateNotFoundError(Exception):
     """Raised when no reference rate is available for a (date, pair)."""
+
+
+class FXRateStore(Protocol):
+    """
+    Minimal interface for the `fx_rates` table read access. Lets us inject a
+    fake in tests without pulling asyncpg / SQLAlchemy in. The real
+    implementation against the database is wired in Session 3 / 4.
+
+    Returns (rate_date, reference_rate) for the latest row whose `rate_date`
+    is at or before `on_or_before` for the given pair. The single method
+    handles both the exact-match case (returned `rate_date == on_or_before`)
+    and the fallback case (returned `rate_date < on_or_before`).
+    """
+
+    async def get_latest_reference_rate_on_or_before(
+        self, on_or_before: date, currency_pair: str
+    ) -> tuple[date, Decimal] | None: ...
 
 
 @dataclass(frozen=True)
@@ -96,25 +133,137 @@ def stamp_fx_event(
     )
 
 
+def _parse_pair(pair: str) -> tuple[str, str]:
+    """
+    Split an internal pair token like 'USD_INR' into (base, quote).
+
+    The internal canonical format is 'BASE_QUOTE' (e.g., 'USD_INR'); the
+    external API expects them as separate `base=`/`symbols=` query params.
+    """
+    if "_" not in pair:
+        raise ValueError(f"Invalid currency pair token: {pair!r} (expected 'BASE_QUOTE').")
+    base, quote = pair.split("_", 1)
+    return base, quote
+
+
 async def fetch_reference_rate(
     rate_date: date,
     pair: str = "USD_INR",
-    db: object | None = None,
+    store: FXRateStore | None = None,
 ) -> Decimal:
     """
-    Look up the reference rate for a given date and currency pair.
+    Read the mid-market reference rate for a (date, pair) from the `fx_rates`
+    store. The store is the system's source of truth — see
+    docs/business-logic/fx-and-wire-transfers.md. This function never calls
+    the live API: that is the populator job's responsibility (see
+    `fetch_reference_rate_from_api`). Reading from the store only is what
+    makes historical balance replays deterministic.
 
-    Returns the `reference_rate` from the `fx_rates` table.
+    Resolution:
+      - If a row exists for exactly `rate_date`, return it.
+      - Otherwise, return the most recent stored rate with
+        `rate_date <= requested_date` and emit a structured WARNING log
+        identifying that a fallback was used.
+      - If no row exists at or before `rate_date`, raise
+        `FXRateNotFoundError`. The app does not silently fail — see the
+        "When the reference rate is missing" section in the doc.
 
-    Raises:
-        FXRateNotFoundError: if no row exists for (rate_date, pair).
-
-    TODO Session 3: implement against asyncpg / SQLAlchemy session.
-        - Query: SELECT reference_rate FROM fx_rates
-                 WHERE rate_date = $1 AND currency_pair = $2 LIMIT 1;
-        - On miss: log a warning and raise FXRateNotFoundError.
-        - Wire up the daily exchangerate.host snapshot job (separate cron).
+    The single store call handles both exact-match and fallback because the
+    DB query (`ORDER BY rate_date DESC LIMIT 1`) returns the most recent
+    row, which is the exact-match row when one exists.
     """
-    raise NotImplementedError(
-        "TODO Session 3: implement reference rate lookup against fx_rates table"
+    if store is None:
+        raise FXRateNotFoundError(
+            f"No reference rate available for {pair} on or before {rate_date.isoformat()}: "
+            "no fx_rates store was provided."
+        )
+
+    result = await store.get_latest_reference_rate_on_or_before(
+        on_or_before=rate_date, currency_pair=pair
     )
+    if result is None:
+        raise FXRateNotFoundError(
+            f"No reference rate available for {pair} on or before {rate_date.isoformat()}: "
+            "the fx_rates store has no row for this pair on or before that date."
+        )
+
+    found_date, rate = result
+    if found_date != rate_date:
+        # Fallback in use — surface it to the audit trail.
+        logger.warning(
+            "fx_rate_fallback",
+            extra={
+                "event": "fx_rate_fallback",
+                "requested_date": rate_date.isoformat(),
+                "fallback_date": found_date.isoformat(),
+                "pair": pair,
+            },
+        )
+    return rate
+
+
+async def fetch_reference_rate_from_api(
+    rate_date: date,
+    pair: str = "USD_INR",
+    http_client: httpx.AsyncClient | None = None,
+) -> Decimal | None:
+    """
+    Fetch a reference rate from the live exchangerate.host API.
+
+    This is the populator-side entry point — invoked by the daily snapshot
+    cron job (Session 8) to write a row into `fx_rates`. Read-time callers
+    must not invoke this directly: read from the store via
+    `fetch_reference_rate` instead, so historical balance computations stay
+    deterministic.
+
+    Returns the parsed Decimal rate on success, or None on any failure
+    (network error, non-200, malformed JSON, missing fields, unparseable
+    rate value). The cron decides what to do with None — typically log and
+    skip writing for that day, then alert if multiple consecutive days
+    fail.
+    """
+    base, quote = _parse_pair(pair)
+    return await _fetch_from_exchangerate_host(rate_date, base, quote, http_client)
+
+
+async def _fetch_from_exchangerate_host(
+    rate_date: date,
+    base: str,
+    quote: str,
+    http_client: httpx.AsyncClient | None,
+) -> Decimal | None:
+    """
+    Single attempt at the live API. Returns None on any failure (network,
+    non-200, missing field, parse error). Never raises — the caller decides
+    whether to surface the error or skip writing.
+    """
+    url = f"{EXCHANGERATE_HOST_BASE}/{rate_date.isoformat()}"
+    params = {"base": base, "symbols": quote}
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=10.0)
+    try:
+        try:
+            response = await client.get(url, params=params)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            payload: dict[str, Any] = response.json()
+        except ValueError:
+            return None
+        rates = payload.get("rates")
+        if not isinstance(rates, dict):
+            return None
+        raw = rates.get(quote)
+        if raw is None:
+            return None
+        # str() round-trip avoids float→Decimal precision drift if the API
+        # returned a JSON number that parsed as a Python float.
+        try:
+            return Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            return None
+    finally:
+        if owns_client:
+            await client.aclose()
