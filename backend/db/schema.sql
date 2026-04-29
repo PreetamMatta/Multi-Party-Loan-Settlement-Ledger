@@ -321,14 +321,216 @@ CREATE INDEX idx_documents_doc_type ON documents(doc_type);
 
 
 -- =============================================================================
--- View stubs — implemented in Session 3
+-- COMPUTED VIEWS
+-- Session 3 — see docs/business-logic/computed-views.md for the contracts.
+--
+-- These views are the read interface for the ledger. Consumers go through
+-- them rather than crafting ad-hoc queries against `events`. The interest-
+-- aware balance is intentionally NOT a SQL view — see the Python
+-- `get_interpersonal_balance_with_interest` function in core/balance.py
+-- (rate-change accrual requires procedural logic).
 -- =============================================================================
--- v_interpersonal_balances : per (lender, borrower) pair on a property, the
---                            current net balance derived from event replay.
--- v_bank_loan_balances     : per loan, outstanding principal as of now,
---                            derived from event replay (not stored).
--- v_owner_contributions    : per owner, total CapEx + OpEx contributed in
---                            property currency equivalent.
--- v_emi_upcoming           : next pending EMI per loan with the assigned payer
---                            (if any), surfaced for the dashboard.
--- =============================================================================
+
+
+-- v_interpersonal_balances --------------------------------------------------
+-- Net principal balance per (property, lender, borrower) pair, derived from
+-- event replay. PRINCIPAL ONLY — accrued interest is layered in by the Python
+-- engine. Time-travel queries belong to the Python projection function;
+-- this view is the "now" snapshot.
+--
+-- Sign convention: principal_balance_inr is what borrower_owner_id owes
+-- lender_owner_id. Positive = debt; zero = settled; negative = the named
+-- lender is actually the debtor.
+CREATE OR REPLACE VIEW v_interpersonal_balances AS
+WITH pair_events AS (
+    -- Outbound: actor=lender lending to target=borrower (DISBURSEMENT, FX context).
+    SELECT
+        e.property_id,
+        e.actor_owner_id   AS lender_owner_id,
+        e.target_owner_id  AS borrower_owner_id,
+        e.event_type,
+        COALESCE(e.amount_property_currency, 0) AS signed_amount,
+        e.effective_date
+      FROM events e
+     WHERE e.target_owner_id IS NOT NULL
+       AND e.event_type = 'INTERPERSONAL_LOAN_DISBURSEMENT'
+
+    UNION ALL
+
+    -- Inbound: actor=borrower repaying target=lender. Normalize to lender→borrower
+    -- framing with a negative sign.
+    SELECT
+        e.property_id,
+        e.target_owner_id  AS lender_owner_id,
+        e.actor_owner_id   AS borrower_owner_id,
+        e.event_type,
+        -COALESCE(e.amount_property_currency, 0) AS signed_amount,
+        e.effective_date
+      FROM events e
+     WHERE e.target_owner_id IS NOT NULL
+       AND e.event_type IN ('INTERPERSONAL_LOAN_REPAYMENT', 'SETTLEMENT')
+
+    UNION ALL
+
+    -- OPEX_SPLIT: actor=share-owner, target=payer; split owes payer.
+    -- Skip self-shares (actor=target) since they net to zero.
+    SELECT
+        e.property_id,
+        e.target_owner_id  AS lender_owner_id,
+        e.actor_owner_id   AS borrower_owner_id,
+        e.event_type,
+        COALESCE(e.amount_property_currency, 0) AS signed_amount,
+        e.effective_date
+      FROM events e
+     WHERE e.event_type = 'OPEX_SPLIT'
+       AND e.target_owner_id IS NOT NULL
+       AND e.actor_owner_id <> e.target_owner_id
+
+    UNION ALL
+
+    -- COMPENSATING_ENTRY rows. metadata.original_event_type drives the
+    -- direction; amount_property_currency is already negated by the helper
+    -- that created the row.
+    SELECT
+        e.property_id,
+        CASE
+            WHEN e.metadata->>'original_event_type' = 'INTERPERSONAL_LOAN_DISBURSEMENT'
+                THEN e.actor_owner_id
+            ELSE e.target_owner_id
+        END AS lender_owner_id,
+        CASE
+            WHEN e.metadata->>'original_event_type' = 'INTERPERSONAL_LOAN_DISBURSEMENT'
+                THEN e.target_owner_id
+            ELSE e.actor_owner_id
+        END AS borrower_owner_id,
+        e.event_type,
+        CASE
+            WHEN e.metadata->>'original_event_type' = 'INTERPERSONAL_LOAN_DISBURSEMENT'
+                THEN COALESCE(e.amount_property_currency, 0)
+            ELSE -COALESCE(e.amount_property_currency, 0)
+        END AS signed_amount,
+        e.effective_date
+      FROM events e
+     WHERE e.event_type = 'COMPENSATING_ENTRY'
+       AND e.target_owner_id IS NOT NULL
+       AND e.metadata->>'original_event_type' IN (
+           'INTERPERSONAL_LOAN_DISBURSEMENT',
+           'INTERPERSONAL_LOAN_REPAYMENT',
+           'SETTLEMENT',
+           'OPEX_SPLIT'
+       )
+)
+SELECT
+    property_id,
+    lender_owner_id,
+    borrower_owner_id,
+    SUM(signed_amount)::NUMERIC(15,2) AS principal_balance_inr,
+    MAX(effective_date)               AS last_event_date
+  FROM pair_events
+ GROUP BY property_id, lender_owner_id, borrower_owner_id;
+
+
+-- v_bank_loan_balances ------------------------------------------------------
+-- Outstanding principal per bank loan = original principal minus paid
+-- principal components from EMIs and BULK_PREPAYMENTs. The interest portion
+-- of EMIs is the bank's revenue and never reduces principal.
+CREATE OR REPLACE VIEW v_bank_loan_balances AS
+WITH paid_emi_principal AS (
+    SELECT
+        loan_id,
+        SUM(principal_component)        AS principal_paid,
+        MAX(paid_at::date)              AS last_paid_date
+      FROM emi_schedule
+     WHERE status IN ('paid', 'prepaid')
+     GROUP BY loan_id
+),
+bulk_principal AS (
+    SELECT
+        loan_id,
+        SUM(amount_property_currency)   AS principal_paid,
+        MAX(effective_date)             AS last_paid_date
+      FROM events
+     WHERE event_type = 'BULK_PREPAYMENT'
+       AND loan_id IS NOT NULL
+     GROUP BY loan_id
+)
+SELECT
+    bl.id                                                            AS loan_id,
+    bl.lender_name,
+    bl.principal_inr                                                 AS original_principal_inr,
+    COALESCE(pe.principal_paid, 0) + COALESCE(bp.principal_paid, 0)  AS total_paid_principal_inr,
+    GREATEST(
+        bl.principal_inr
+            - COALESCE(pe.principal_paid, 0)
+            - COALESCE(bp.principal_paid, 0),
+        0
+    )::NUMERIC(15,2)                                                 AS outstanding_principal_inr,
+    GREATEST(
+        COALESCE(pe.last_paid_date, '0001-01-01'::date),
+        COALESCE(bp.last_paid_date, '0001-01-01'::date)
+    )                                                                AS last_payment_date
+  FROM bank_loans bl
+  LEFT JOIN paid_emi_principal pe ON pe.loan_id = bl.id
+  LEFT JOIN bulk_principal     bp ON bp.loan_id = bl.id;
+
+
+-- v_owner_contributions -----------------------------------------------------
+-- Per-owner CapEx + OpEx contribution totals in property currency.
+-- CapEx aggregates CONTRIBUTION (full amount), EMI_PAYMENT (principal only),
+-- BULK_PREPAYMENT (full amount). OpEx aggregates the owner's share of OpEx
+-- expenses via opex_splits.
+--
+-- Cross-currency events are credited at inr_landed; same-currency at
+-- amount_property_currency. COALESCE applies the rule.
+CREATE OR REPLACE VIEW v_owner_contributions AS
+WITH capex AS (
+    SELECT
+        e.actor_owner_id     AS owner_id,
+        e.property_id,
+        SUM(
+            CASE
+                WHEN e.event_type = 'EMI_PAYMENT'
+                    THEN COALESCE((e.metadata->>'principal_component')::NUMERIC, 0)
+                ELSE COALESCE(e.inr_landed, e.amount_property_currency, 0)
+            END
+        ) AS capex_inr
+      FROM events e
+     WHERE e.event_type IN ('CONTRIBUTION', 'EMI_PAYMENT', 'BULK_PREPAYMENT')
+     GROUP BY e.actor_owner_id, e.property_id
+),
+opex AS (
+    SELECT
+        os.owner_id,
+        e.property_id,
+        SUM(os.amount_owed_property_currency) AS opex_inr
+      FROM opex_splits os
+      JOIN events e ON e.id = os.event_id
+     GROUP BY os.owner_id, e.property_id
+)
+SELECT
+    COALESCE(c.owner_id, o.owner_id)                          AS owner_id,
+    COALESCE(c.property_id, o.property_id)                    AS property_id,
+    COALESCE(c.capex_inr, 0)::NUMERIC(15,2)                   AS capex_inr,
+    COALESCE(o.opex_inr, 0)::NUMERIC(15,2)                    AS opex_inr,
+    (COALESCE(c.capex_inr, 0) + COALESCE(o.opex_inr, 0))::NUMERIC(15,2) AS total_inr
+  FROM capex c
+  FULL OUTER JOIN opex o
+    ON o.owner_id = c.owner_id AND o.property_id = c.property_id;
+
+
+-- v_emi_upcoming ------------------------------------------------------------
+-- Next pending EMIs across active loans, with the assigned payer if any.
+-- Callers typically `ORDER BY due_date ASC LIMIT N`. The
+-- idx_emi_schedule_pending partial index covers the filter.
+CREATE OR REPLACE VIEW v_emi_upcoming AS
+SELECT
+    es.loan_id,
+    bl.lender_name,
+    es.due_date,
+    es.principal_component,
+    es.interest_component,
+    es.total_emi          AS total_emi_inr,
+    es.paid_by_owner_id
+  FROM emi_schedule es
+  JOIN bank_loans   bl ON bl.id = es.loan_id
+ WHERE es.status = 'pending';

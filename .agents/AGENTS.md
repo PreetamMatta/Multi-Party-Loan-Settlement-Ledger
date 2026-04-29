@@ -97,13 +97,32 @@ These are hard constraints. Violations require an explicit migration discussion 
 ```
 Session 1 — Scaffold, docs, schema, backend foundation       ← COMPLETE
 Session 2 — Business logic docs, event log impl + HMAC tests, FX fetcher  ← COMPLETE
-Session 3 — Balance projection engine, computed views        ← NEXT
-Session 4 — FastAPI endpoints (contribution, payment, settlement, FX)
+Session 3 — Balance projection engine, interest accrual, computed views   ← COMPLETE
+Session 4 — FastAPI endpoints (contribution, payment, settlement, FX)     ← NEXT
 Session 5 — FastMCP tool surface implementation
-Session 6 — Exit scenario calculator, per-FY interest statements
+Session 6 — Exit scenario CPI inflation adjustment, per-FY interest UX polish
 Session 7 — Frontend (Next.js, TanStack Table, Recharts dashboard)
 Session 8 — Docker prod config, nightly export, Git sync cron
 ```
+
+## Projection Engine Contract (Session 3)
+
+These four invariants govern every balance read in the system. They are
+documented in detail in `docs/business-logic/balances-and-equity.md#projection-contract`.
+
+- **Balances are always in property currency.** Cross-currency events are
+  credited at `inr_landed` (the dual-rate rule); same-currency events at
+  `amount_property_currency`.
+- **`as_of_date` uses `effective_date`, never `recorded_at`.** A query for
+  date X returns the state as of business-date X, regardless of when rows
+  were entered.
+- **Principal-only and interest-aware are separate functions.**
+  `get_interpersonal_balance` returns principal; the composite
+  `get_interpersonal_balance_with_interest` adds accrued interest. Tax /
+  audit consumers usually want principal alone.
+- **`COMPENSATING_ENTRY` applies at its OWN `effective_date`.** Both the
+  original and the compensating row persist; the projection sums them
+  with their natural signs.
 
 ## Key Documented Decisions
 

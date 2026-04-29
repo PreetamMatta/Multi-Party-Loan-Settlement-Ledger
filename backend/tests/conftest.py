@@ -26,6 +26,12 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+# Tests share helpers via top-level modules (e.g. `_fakes`); expose them by
+# adding the tests directory itself to sys.path.
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+
 from core.events import EventType, LedgerEvent  # noqa: E402
 
 

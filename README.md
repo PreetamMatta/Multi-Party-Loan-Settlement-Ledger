@@ -85,7 +85,8 @@ Any group of N co-owners — siblings, cousins, friends, partners — who:
 │   │   ├── fx.py                      # dual-rate FX stamping + reference-rate fetch with fallback
 │   │   ├── balance.py                 # balance projection engine (Session 3)
 │   │   └── interest.py                # interpersonal interest accrual (Session 3/6)
-│   ├── tests/                         # pytest suite (test_events, test_fx, test_fx_fetcher)
+│   ├── tests/                         # pytest suite (test_events, test_fx, test_fx_fetcher, test_balance, test_interest)
+│   │   └── functional/                # functional tests against a real Postgres (TEST_DATABASE_URL)
 │   ├── api/
 │   │   ├── app.py                     # FastAPI app factory
 │   │   ├── dependencies.py            # DB + auth dependencies
@@ -121,6 +122,21 @@ docker compose up -d
 docker compose down -v && docker compose up -d
 ```
 
+## Running tests
+
+```bash
+# Unit tests — fast, no database required:
+cd backend && uv run pytest
+
+# Functional tests — require a Postgres test database:
+docker run --rm -d --name ledger-test-db \
+    -e POSTGRES_PASSWORD=test -e POSTGRES_DB=ledger_test \
+    -p 5433:5432 postgres:16
+TEST_DATABASE_URL=postgres://postgres:test@localhost:5433/ledger_test \
+    uv run pytest backend/tests/functional/
+docker stop ledger-test-db
+```
+
 ## Business logic
 
 The authoritative reference for *how the ledger thinks* lives under
@@ -135,6 +151,7 @@ the code needs fixing.
 | [interpersonal-loans.md](docs/business-logic/interpersonal-loans.md) | Forward-only rate changes, simple-interest actual/365 accrual, per-financial-year statement shape, balance computation algorithm. |
 | [balances-and-equity.md](docs/business-logic/balances-and-equity.md) | Equity is fixed at setup; balances are projections. The one-time t=0 floor-premium adjustment is the only equity exception. |
 | [exit-scenarios.md](docs/business-logic/exit-scenarios.md) | Three buyout numbers (net contribution, market-value share, weighted blend), shared-floor election, hard limits on what the calculator does. |
+| [computed-views.md](docs/business-logic/computed-views.md) | The read interface: four SQL views and one Python function that consumers go through to read balances. |
 
 ## Key design decisions
 
