@@ -16,96 +16,14 @@ docs/business-logic/computed-views.md for the contracts.
 
 from __future__ import annotations
 
-import json
 import uuid
-from collections.abc import Iterable
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from core.events import EventType, LedgerEvent, get_financial_effect
+from core._db import _EVENT_COLUMNS, _events_to_pair_balance, _row_to_event
+from core.events import get_financial_effect
 from core.interest import calculate_accrued_interest
-
-
-# -----------------------------------------------------------------------------
-# Internal helpers
-# -----------------------------------------------------------------------------
-def _row_to_event(row: Any) -> LedgerEvent:
-    """
-    Reconstruct a LedgerEvent from an asyncpg.Record (or any mapping with the
-    same column names). Used by the projection paths to feed `get_financial_effect`.
-
-    The HMAC signature is intentionally NOT re-verified here — verification is
-    a separate audit concern; balance math trusts the log.
-    """
-    metadata = row["metadata"]
-    if isinstance(metadata, str):
-        metadata = json.loads(metadata) if metadata else {}
-    elif metadata is None:
-        metadata = {}
-
-    recorded_at = row["recorded_at"]
-    if isinstance(recorded_at, str):
-        recorded_at = datetime.fromisoformat(recorded_at)
-
-    return LedgerEvent(
-        id=row["id"],
-        property_id=row["property_id"],
-        event_type=EventType(row["event_type"]),
-        actor_owner_id=row["actor_owner_id"],
-        target_owner_id=row["target_owner_id"],
-        loan_id=row["loan_id"],
-        amount_source_currency=row["amount_source_currency"],
-        source_currency=row["source_currency"],
-        amount_property_currency=row["amount_property_currency"],
-        property_currency=row["property_currency"],
-        fx_rate_actual=row["fx_rate_actual"],
-        fx_rate_reference=row["fx_rate_reference"],
-        fee_source_currency=row["fee_source_currency"],
-        inr_landed=row["inr_landed"],
-        description=row["description"],
-        metadata=metadata,
-        reverses_event_id=row["reverses_event_id"],
-        hmac_signature=row["hmac_signature"],
-        recorded_by=row["recorded_by"],
-        recorded_at=recorded_at,
-        effective_date=row["effective_date"],
-    )
-
-
-_EVENT_COLUMNS = (
-    "id, property_id, event_type, actor_owner_id, target_owner_id, loan_id, "
-    "amount_source_currency, source_currency, amount_property_currency, "
-    "property_currency, fx_rate_actual, fx_rate_reference, fee_source_currency, "
-    "inr_landed, description, metadata, reverses_event_id, hmac_signature, "
-    "recorded_by, recorded_at, effective_date"
-)
-
-
-def _events_to_pair_balance(
-    events: Iterable[LedgerEvent],
-    lender_id: uuid.UUID,
-    borrower_id: uuid.UUID,
-) -> Decimal:
-    """
-    Fold the event stream into a net (borrower owes lender) principal balance.
-
-    The router returns deltas in normalized lender→borrower framing. If a
-    routed effect's lender/borrower matches the requested pair direction we
-    add; if it matches the reverse direction we subtract; otherwise we ignore
-    (events touching only one of the pair members but not both).
-    """
-    balance = Decimal("0")
-    for event in events:
-        effect = get_financial_effect(event)
-        ip = effect.get("interpersonal")
-        if ip is None:
-            continue
-        if ip["lender"] == lender_id and ip["borrower"] == borrower_id:
-            balance += ip["delta"]
-        elif ip["lender"] == borrower_id and ip["borrower"] == lender_id:
-            balance -= ip["delta"]
-    return balance
 
 
 # -----------------------------------------------------------------------------
@@ -288,14 +206,21 @@ async def project_exit_scenario(
     db: Any,
     blend_weight_contribution: Decimal = Decimal("0.5"),
     blend_weight_market: Decimal = Decimal("0.5"),
+    as_of_date: date | None = None,
 ) -> dict[str, Any]:
     """
     Compute the three buyout numbers for `owner_id`.
 
     Spec: docs/business-logic/exit-scenarios.md
 
-    Returns a dict with the three numbers, the inputs used (for auditability),
-    and a warning string when relevant inputs are missing.
+    `as_of_date` defaults to today. Pass an explicit date for historical
+    queries ("what was the buyout number on 2025-12-31?") or deterministic
+    tests. All sub-calls (contributions, interpersonal balances) use the
+    same `as_of_date` consistently with Projection Contract §2.
+
+    `blend_weight_contribution + blend_weight_market` must equal exactly 1;
+    a ValueError is raised otherwise to prevent silent wrong answers in
+    financial decisions.
 
     Buyout #1 (`buyout_net_contribution`):
         net_capex - debts_owed_to_others + credits_owed_by_others
@@ -311,7 +236,15 @@ async def project_exit_scenario(
         weight_c * Buyout1 + weight_m * Buyout2
         Default weights 50/50; callers can override.
     """
-    today = date.today()
+    if as_of_date is None:
+        as_of_date = date.today()
+
+    if blend_weight_contribution + blend_weight_market != Decimal("1"):
+        raise ValueError(
+            f"blend_weight_contribution + blend_weight_market must equal 1, "
+            f"got {blend_weight_contribution} + {blend_weight_market} = "
+            f"{blend_weight_contribution + blend_weight_market}"
+        )
 
     equity_pct_raw = await db.fetchval(
         "SELECT equity_pct FROM owners WHERE id = $1 AND property_id = $2",
@@ -325,7 +258,7 @@ async def project_exit_scenario(
         equity_pct = Decimal(equity_pct_raw)
         warning = None
 
-    contributions = await get_owner_contributions(owner_id, property_id, today, db)
+    contributions = await get_owner_contributions(owner_id, property_id, as_of_date, db)
     capex = contributions["capex_inr"]
 
     # Find every counterparty this owner has had any inter-personal interaction
@@ -358,9 +291,9 @@ async def project_exit_scenario(
     for row in counterparty_rows:
         cp = row["counterparty"]
         # owner as borrower → other as lender → "what owner owes other"
-        owed_by_owner = await get_interpersonal_balance(cp, owner_id, today, db)
+        owed_by_owner = await get_interpersonal_balance(cp, owner_id, as_of_date, db)
         # owner as lender → other as borrower → "what other owes owner"
-        owed_to_owner = await get_interpersonal_balance(owner_id, cp, today, db)
+        owed_to_owner = await get_interpersonal_balance(owner_id, cp, as_of_date, db)
         if owed_by_owner > 0:
             debts_owed += owed_by_owner
         if owed_to_owner > 0:
@@ -375,7 +308,7 @@ async def project_exit_scenario(
 
     return {
         "owner_id": owner_id,
-        "as_of_date": today,
+        "as_of_date": as_of_date,
         "equity_pct": equity_pct,
         "buyout_net_contribution": buyout_net_contribution,
         "buyout_market_value_share": buyout_market_value_share,

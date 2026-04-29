@@ -406,8 +406,20 @@ WITH pair_events AS (
         e.event_type,
         CASE
             WHEN e.metadata->>'original_event_type' = 'INTERPERSONAL_LOAN_DISBURSEMENT'
+                -- amount_property_currency is already negated → direct use cancels
+                -- the original positive disbursement credit.
                 THEN COALESCE(e.amount_property_currency, 0)
-            ELSE -COALESCE(e.amount_property_currency, 0)
+            WHEN e.metadata->>'original_event_type' = 'OPEX_SPLIT'
+                -- OPEX_SPLIT original was positive (actor owes target); compensating
+                -- entry amount is already negated → direct use cancels the original
+                -- positive debt. Double-negating would double the debt instead.
+                THEN COALESCE(e.amount_property_currency, 0)
+            ELSE
+                -- INTERPERSONAL_LOAN_REPAYMENT and SETTLEMENT: original was stored
+                -- as negative in the view (amount negated). The compensating entry
+                -- amount is also negated, so flip once to produce a positive value
+                -- that cancels the negative original.
+                -COALESCE(e.amount_property_currency, 0)
         END AS signed_amount,
         e.effective_date
       FROM events e
@@ -431,57 +443,88 @@ SELECT
 
 
 -- v_bank_loan_balances ------------------------------------------------------
--- Outstanding principal per bank loan = original principal minus paid
--- principal components from EMIs and BULK_PREPAYMENTs. The interest portion
--- of EMIs is the bank's revenue and never reduces principal.
+-- Outstanding principal per bank loan derived entirely from the events table.
+-- Includes COMPENSATING_ENTRY rows that reverse EMI_PAYMENT or BULK_PREPAYMENT
+-- so that append-only corrections immediately update the outstanding balance.
+--
+-- principal_delta semantics: positive = reduction in outstanding (payment or
+-- prepayment); negative = restoration (compensating entry reversal). The
+-- view computes outstanding = original_principal - SUM(deltas).
 CREATE OR REPLACE VIEW v_bank_loan_balances AS
-WITH paid_emi_principal AS (
+WITH loan_principal_events AS (
+    -- EMI_PAYMENT: principal_component is stored in metadata.
     SELECT
-        loan_id,
-        SUM(principal_component)        AS principal_paid,
-        MAX(paid_at::date)              AS last_paid_date
-      FROM emi_schedule
-     WHERE status IN ('paid', 'prepaid')
-     GROUP BY loan_id
-),
-bulk_principal AS (
+        e.loan_id,
+        COALESCE((e.metadata->>'principal_component')::NUMERIC, 0) AS principal_delta,
+        e.effective_date
+      FROM events e
+     WHERE e.event_type = 'EMI_PAYMENT'
+       AND e.loan_id IS NOT NULL
+
+    UNION ALL
+
+    -- BULK_PREPAYMENT: full amount reduces principal.
     SELECT
-        loan_id,
-        SUM(amount_property_currency)   AS principal_paid,
-        MAX(effective_date)             AS last_paid_date
-      FROM events
-     WHERE event_type = 'BULK_PREPAYMENT'
-       AND loan_id IS NOT NULL
-     GROUP BY loan_id
+        e.loan_id,
+        COALESCE(e.amount_property_currency, 0) AS principal_delta,
+        e.effective_date
+      FROM events e
+     WHERE e.event_type = 'BULK_PREPAYMENT'
+       AND e.loan_id IS NOT NULL
+
+    UNION ALL
+
+    -- COMPENSATING_ENTRY reversing EMI_PAYMENT: metadata.principal_component
+    -- is already negated by build_compensating_entry → negative delta restores
+    -- the principal that the original EMI_PAYMENT had reduced.
+    SELECT
+        e.loan_id,
+        COALESCE((e.metadata->>'principal_component')::NUMERIC, 0) AS principal_delta,
+        e.effective_date
+      FROM events e
+     WHERE e.event_type = 'COMPENSATING_ENTRY'
+       AND e.loan_id IS NOT NULL
+       AND e.metadata->>'original_event_type' = 'EMI_PAYMENT'
+
+    UNION ALL
+
+    -- COMPENSATING_ENTRY reversing BULK_PREPAYMENT: amount_property_currency
+    -- is already negated → negative delta restores the prepaid principal.
+    SELECT
+        e.loan_id,
+        COALESCE(e.amount_property_currency, 0) AS principal_delta,
+        e.effective_date
+      FROM events e
+     WHERE e.event_type = 'COMPENSATING_ENTRY'
+       AND e.loan_id IS NOT NULL
+       AND e.metadata->>'original_event_type' = 'BULK_PREPAYMENT'
 )
 SELECT
-    bl.id                                                            AS loan_id,
+    bl.id                                                       AS loan_id,
     bl.lender_name,
-    bl.principal_inr                                                 AS original_principal_inr,
-    COALESCE(pe.principal_paid, 0) + COALESCE(bp.principal_paid, 0)  AS total_paid_principal_inr,
+    bl.principal_inr                                            AS original_principal_inr,
+    COALESCE(SUM(lpe.principal_delta), 0)::NUMERIC(15,2)        AS total_paid_principal_inr,
     GREATEST(
-        bl.principal_inr
-            - COALESCE(pe.principal_paid, 0)
-            - COALESCE(bp.principal_paid, 0),
+        bl.principal_inr - COALESCE(SUM(lpe.principal_delta), 0),
         0
-    )::NUMERIC(15,2)                                                 AS outstanding_principal_inr,
-    GREATEST(
-        COALESCE(pe.last_paid_date, '0001-01-01'::date),
-        COALESCE(bp.last_paid_date, '0001-01-01'::date)
-    )                                                                AS last_payment_date
+    )::NUMERIC(15,2)                                            AS outstanding_principal_inr,
+    MAX(lpe.effective_date)                                     AS last_payment_date
   FROM bank_loans bl
-  LEFT JOIN paid_emi_principal pe ON pe.loan_id = bl.id
-  LEFT JOIN bulk_principal     bp ON bp.loan_id = bl.id;
+  LEFT JOIN loan_principal_events lpe ON lpe.loan_id = bl.id
+ GROUP BY bl.id, bl.lender_name, bl.principal_inr;
 
 
 -- v_owner_contributions -----------------------------------------------------
 -- Per-owner CapEx + OpEx contribution totals in property currency.
 -- CapEx aggregates CONTRIBUTION (full amount), EMI_PAYMENT (principal only),
--- BULK_PREPAYMENT (full amount). OpEx aggregates the owner's share of OpEx
--- expenses via opex_splits.
+-- BULK_PREPAYMENT (full amount), and COMPENSATING_ENTRY rows that reverse
+-- any of those (which carry negated amounts and thus reduce the totals).
+-- OpEx aggregates the owner's share of OpEx expenses via opex_splits.
 --
 -- Cross-currency events are credited at inr_landed; same-currency at
--- amount_property_currency. COALESCE applies the rule.
+-- amount_property_currency. COALESCE applies the dual-rate rule.
+-- For EMI_PAYMENT (and its compensating entries), only the principal component
+-- counts — the interest component is the bank's revenue, not a contribution.
 CREATE OR REPLACE VIEW v_owner_contributions AS
 WITH capex AS (
     SELECT
@@ -490,12 +533,24 @@ WITH capex AS (
         SUM(
             CASE
                 WHEN e.event_type = 'EMI_PAYMENT'
+                  OR (e.event_type = 'COMPENSATING_ENTRY'
+                      AND e.metadata->>'original_event_type' = 'EMI_PAYMENT')
+                    -- principal_component is negated on compensating entries
+                    -- → automatically reduces the sum.
                     THEN COALESCE((e.metadata->>'principal_component')::NUMERIC, 0)
-                ELSE COALESCE(e.inr_landed, e.amount_property_currency, 0)
+                ELSE
+                    -- CONTRIBUTION, BULK_PREPAYMENT, and their compensating
+                    -- entries. inr_landed and amount_property_currency are
+                    -- negated on compensating entries → reduces the sum.
+                    COALESCE(e.inr_landed, e.amount_property_currency, 0)
             END
         ) AS capex_inr
       FROM events e
      WHERE e.event_type IN ('CONTRIBUTION', 'EMI_PAYMENT', 'BULK_PREPAYMENT')
+        OR (e.event_type = 'COMPENSATING_ENTRY'
+            AND e.metadata->>'original_event_type' IN (
+                'CONTRIBUTION', 'EMI_PAYMENT', 'BULK_PREPAYMENT'
+            ))
      GROUP BY e.actor_owner_id, e.property_id
 ),
 opex AS (

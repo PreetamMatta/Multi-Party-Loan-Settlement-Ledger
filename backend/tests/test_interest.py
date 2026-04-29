@@ -399,11 +399,9 @@ async def test_fy_statement_events_list_contains_only_fy_events(make_event):
     in_fy = _disbursement(
         make_event, lender=lender, borrower=borrower, amount="10000", on=date(2026, 6, 1)
     )
-    # The fetcher returns all events in the FY range — the function does
-    # not double-filter, but it also won't include rows outside the window
-    # because the SQL filter uses BETWEEN.
+    # Single DB fetch returns all pair events up to fy_end; the function
+    # partitions them in-memory so the audit list only shows FY events.
     db = FakeConnection()
-    db.on_fetch("BETWEEN $3 AND $4", [event_to_row(in_fy)])
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(in_fy)])
     result = await generate_fy_statement(lender, borrower, 2026, db, calendar="IN")
     assert len(result["events"]) == 1
@@ -584,8 +582,6 @@ async def test_fy_statement_totals_disbursed_and_repaid(make_event):
     )
     db = FakeConnection()
     rows = [event_to_row(disb), event_to_row(repay)]
-    # Same handler matches both the FY events query and the per-pair queries
-    # the function makes internally.
     db.on_fetch("target_owner_id IS NOT NULL", rows)
     result = await generate_fy_statement(lender, borrower, 2026, db, calendar="IN")
     assert result["total_disbursed_inr"] == Decimal("100000")
@@ -610,6 +606,126 @@ async def test_interest_engine_null_metadata_treated_as_empty(make_event):
         lender, borrower, date(2026, 1, 1), date(2026, 6, 1), db
     )
     assert result == Decimal("0")
+
+
+async def test_compensating_entry_of_repayment_restores_accrued_interest(make_event):
+    """
+    A COMPENSATING_ENTRY that reverses a repayment should restore accrued interest
+    first (up to what existed before the repayment), then principal. Without
+    the inverse-waterfall fix, the full amount would go to principal, causing
+    over-accrual on a too-large principal in subsequent periods.
+
+    Scenario:
+      - ₹100,000 disbursed at 6% on Jan 1.
+      - By Apr 1 (90 days), accrued ≈ ₹1,479.45.
+      - Repayment of ₹2,000 on Apr 1: waterfall first reduces accrued to 0,
+        then reduces principal by ₹520.55 → principal ≈ ₹99,479.45.
+      - Compensating entry reverses the repayment on Apr 1: inverse waterfall
+        restores accrued ≈ ₹1,479.45 first, then principal by ₹520.55
+        → principal back to ₹100,000, accrued back to ₹1,479.45.
+      - Querying Jan 1 → Apr 2: total interest = 90 days + 1 day on ₹100,000
+        = 100,000 × 6/100 × 91/365 (as if no repayment/compensation happened).
+    """
+    lender, borrower = uuid.uuid4(), uuid.uuid4()
+
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
+    rate_row = event_to_row(rate)
+    rate_row["recorded_at"] = datetime(2026, 1, 1, 9, tzinfo=UTC)
+
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
+    disb_row = event_to_row(disb)
+    disb_row["recorded_at"] = datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+    repay = _repayment(
+        make_event, lender=lender, borrower=borrower, amount="2000", on=date(2026, 4, 1)
+    )
+    repay_row = event_to_row(repay)
+
+    # Compensating entry that reverses the repayment: actor=borrower→lender framing
+    # is preserved; amount is negated; metadata carries original_event_type and
+    # reverses_event_id so the inverse-waterfall path is exercised.
+    comp = make_event(
+        event_type=EventType.COMPENSATING_ENTRY,
+        actor_owner_id=borrower,
+        target_owner_id=lender,
+        amount_property_currency=Decimal("-2000"),  # negated
+        effective_date=date(2026, 4, 1),
+        recorded_at=datetime(2026, 4, 1, 13, tzinfo=UTC),
+        reverses_event_id=repay.id,
+        metadata={
+            "original_event_type": "INTERPERSONAL_LOAN_REPAYMENT",
+            "reverses_original_event": str(repay.id),
+        },
+    )
+    comp_row = event_to_row(comp)
+
+    db = FakeConnection()
+    db.on_fetch(
+        "target_owner_id IS NOT NULL",
+        [rate_row, disb_row, repay_row, comp_row],
+    )
+
+    result = await calculate_accrued_interest(
+        lender, borrower, date(2026, 1, 1), date(2026, 4, 2), db
+    )
+    # After compensation, principal is fully restored to ₹100,000.
+    # The engine computes two segments: 90 days (Jan 1→Apr 1) then 1 day tail
+    # (Apr 1→Apr 2). Expected matches this two-segment sum to avoid the 1-ULP
+    # rounding difference that arises from a single 91-day computation.
+    segment_90 = Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("90") / Decimal("365")
+    segment_1 = Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("1") / Decimal("365")
+    expected = segment_90 + segment_1
+    assert result == expected
+
+
+async def test_compensating_entry_of_repayment_unknown_reverses_id_falls_back(make_event):
+    """
+    If a COMPENSATING_ENTRY for a repayment has a reverses_event_id that
+    is not in the event list (e.g., the original is outside the query window),
+    the engine falls back to treating the full amount as principal growth.
+    This is the documented v1 behaviour for cross-window compensations.
+    """
+    lender, borrower = uuid.uuid4(), uuid.uuid4()
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
+    disb_row = event_to_row(disb)
+    disb_row["recorded_at"] = datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+    # Compensating entry whose reverses_event_id does NOT match any event in list.
+    comp = make_event(
+        event_type=EventType.COMPENSATING_ENTRY,
+        actor_owner_id=borrower,
+        target_owner_id=lender,
+        amount_property_currency=Decimal("-1000"),
+        effective_date=date(2026, 4, 1),
+        recorded_at=datetime(2026, 4, 1, 13, tzinfo=UTC),
+        reverses_event_id=uuid.uuid4(),  # unknown ID — not in event list
+        metadata={
+            "original_event_type": "INTERPERSONAL_LOAN_REPAYMENT",
+        },
+    )
+
+    db = FakeConnection()
+    db.on_fetch(
+        "target_owner_id IS NOT NULL",
+        [event_to_row(rate), disb_row, event_to_row(comp)],
+    )
+
+    # comp contributes +1000 to principal (fallback). Accrual is on 101,000
+    # from Apr 1 to Apr 2 (1 day).
+    result = await calculate_accrued_interest(
+        lender, borrower, date(2026, 4, 1), date(2026, 4, 2), db
+    )
+    expected = Decimal("101000") * Decimal("6") / Decimal("100") * Decimal("1") / Decimal("365")
+    assert result == expected
 
 
 # Sanity: keep an unused-import warning quiet.

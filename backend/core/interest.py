@@ -13,18 +13,26 @@ naturally by `(t2 - t1).days` arithmetic. See
 Repayment ordering: repayments apply against accrued interest first, then
 principal. See `docs/business-logic/interpersonal-loans.md#when-accrued-interest-is-paid`.
 
+COMPENSATING_ENTRY waterfall: when a compensating entry reverses a repayment
+or settlement, the restoration applies the inverse of the original waterfall —
+accrued interest is restored first (up to the amount that existed before the
+original repayment), then principal. This preserves the correct running
+principal for future accrual. If the original repayment event is not in the
+query window, the restoration falls back to pure principal (same as a
+disbursement-equivalent).
+
 This module never modifies the events table. It only reads.
 """
 
 from __future__ import annotations
 
 import calendar as _calendar
-import json
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
+from core._db import _EVENT_COLUMNS, _events_to_pair_balance, _row_to_event
 from core.events import EventType, LedgerEvent, get_financial_effect
 
 # -----------------------------------------------------------------------------
@@ -32,56 +40,13 @@ from core.events import EventType, LedgerEvent, get_financial_effect
 # -----------------------------------------------------------------------------
 _DAYS_PER_YEAR = Decimal("365")  # actual/365 — leap years still use 365
 
-
-_EVENT_COLUMNS = (
-    "id, property_id, event_type, actor_owner_id, target_owner_id, loan_id, "
-    "amount_source_currency, source_currency, amount_property_currency, "
-    "property_currency, fx_rate_actual, fx_rate_reference, fee_source_currency, "
-    "inr_landed, description, metadata, reverses_event_id, hmac_signature, "
-    "recorded_by, recorded_at, effective_date"
-)
+# Event types that trigger the interest-first waterfall on reversal.
+_REPAYMENT_TYPES = frozenset(("INTERPERSONAL_LOAN_REPAYMENT", "SETTLEMENT"))
 
 
 # -----------------------------------------------------------------------------
 # Internal helpers
 # -----------------------------------------------------------------------------
-def _row_to_event(row: Any) -> LedgerEvent:
-    """Mirror of balance._row_to_event — kept local to avoid a cross-module import."""
-    metadata = row["metadata"]
-    if isinstance(metadata, str):
-        metadata = json.loads(metadata) if metadata else {}
-    elif metadata is None:
-        metadata = {}
-
-    recorded_at = row["recorded_at"]
-    if isinstance(recorded_at, str):
-        recorded_at = datetime.fromisoformat(recorded_at)
-
-    return LedgerEvent(
-        id=row["id"],
-        property_id=row["property_id"],
-        event_type=EventType(row["event_type"]),
-        actor_owner_id=row["actor_owner_id"],
-        target_owner_id=row["target_owner_id"],
-        loan_id=row["loan_id"],
-        amount_source_currency=row["amount_source_currency"],
-        source_currency=row["source_currency"],
-        amount_property_currency=row["amount_property_currency"],
-        property_currency=row["property_currency"],
-        fx_rate_actual=row["fx_rate_actual"],
-        fx_rate_reference=row["fx_rate_reference"],
-        fee_source_currency=row["fee_source_currency"],
-        inr_landed=row["inr_landed"],
-        description=row["description"],
-        metadata=metadata,
-        reverses_event_id=row["reverses_event_id"],
-        hmac_signature=row["hmac_signature"],
-        recorded_by=row["recorded_by"],
-        recorded_at=recorded_at,
-        effective_date=row["effective_date"],
-    )
-
-
 def _signed_pair_delta(
     event: LedgerEvent,
     lender_id: uuid.UUID,
@@ -89,9 +54,8 @@ def _signed_pair_delta(
 ) -> Decimal:
     """
     Return the principal delta this event applies in the (lender, borrower)
-    direction. Positive = principal grows (a fresh disbursement-equivalent);
-    negative = principal shrinks (a repayment-equivalent before the
-    interest-first waterfall is applied).
+    direction. Positive = principal grows; negative = principal shrinks
+    (before the interest-first waterfall is applied).
     """
     effect = get_financial_effect(event)
     ip = effect.get("interpersonal")
@@ -126,60 +90,37 @@ def _new_rate_from_event(event: LedgerEvent) -> Decimal | None:
 
 
 # -----------------------------------------------------------------------------
-# Spec: docs/business-logic/interpersonal-loans.md#accrual-math---chosen-approach
+# Pure accrual engine (no DB access)
 # -----------------------------------------------------------------------------
-async def calculate_accrued_interest(
+def _accrue_interest_from_events(
+    events: list[LedgerEvent],
     lender_id: uuid.UUID,
     borrower_id: uuid.UUID,
     period_start: date,
     period_end: date,
-    db: Any,
 ) -> Decimal:
     """
-    Total simple interest accrued on the (lender, borrower) loan within
-    `[period_start, period_end]` (both inclusive at the day level).
-
-    Spec: docs/business-logic/interpersonal-loans.md
+    Compute interest accrued within [period_start, period_end] from a
+    pre-fetched, chronologically sorted event list. No DB access.
 
     Algorithm:
-      1. Pull every event touching the pair, in either direction, with
-         `effective_date <= period_end`. Order by (effective_date,
-         recorded_at) ASC — the same ordering balance computation uses.
-      2. Walk events maintaining (running_principal, current_rate,
-         running_accrued_outstanding). On each interval boundary, compute
-         interest at the current rate on the current principal for the
-         elapsed days; if the interval overlaps `[period_start, period_end]`,
-         add the overlap-share to the returned total.
-      3. Apply each event in turn:
-           - DISBURSEMENT-direction delta (+): principal grows
-           - REPAYMENT-direction delta (−): apply interest-first waterfall:
-               first reduce running_accrued_outstanding, remainder reduces
-               principal
-           - INTERPERSONAL_RATE_CHANGE: switch the rate going forward
-           - COMPENSATING_ENTRY: routed through the parent's framing by
-             `get_financial_effect`; treated as a principal delta (we do
-             NOT reverse historical accrual — see module docstring caveat)
-      4. After the last event, accrue forward to `period_end`.
-
-    Zero-rate periods contribute `Decimal('0')`.
+      - Walk events maintaining (running_principal, current_rate,
+        running_accrued_outstanding).
+      - On each interval boundary, compute interest for elapsed days; if the
+        interval overlaps [period_start, period_end], add the overlap share.
+      - DISBURSEMENT-direction delta (+): principal grows.
+      - REPAYMENT-direction delta (−): interest-first waterfall. State before
+        each waterfall is recorded keyed by event.id for use below.
+      - COMPENSATING_ENTRY reversing a repayment/settlement (+): inverse
+        waterfall — restore accrued interest first (up to what was there
+        before the original repayment), then principal. If the original event
+        is not in the recorded-state map, falls back to treating the full
+        amount as principal (same as the current v1 caveat).
+      - INTERPERSONAL_RATE_CHANGE: switch rate forward-only.
     """
-    rows = await db.fetch(
-        f"""
-        SELECT {_EVENT_COLUMNS}
-          FROM events
-         WHERE effective_date <= $3
-           AND target_owner_id IS NOT NULL
-           AND (
-                (actor_owner_id = $1 AND target_owner_id = $2)
-             OR (actor_owner_id = $2 AND target_owner_id = $1)
-           )
-         ORDER BY effective_date ASC, recorded_at ASC
-        """,
-        lender_id,
-        borrower_id,
-        period_end,
-    )
-    events = [_row_to_event(row) for row in rows]
+    # Keyed by event.id: running_accrued just BEFORE the repayment waterfall.
+    # Used to correctly split a compensating-entry restoration.
+    pre_repayment_accrued: dict[Any, Decimal] = {}
 
     running_principal = Decimal("0")
     running_accrued = Decimal("0")
@@ -193,12 +134,10 @@ async def calculate_accrued_interest(
             interval_days = (event.effective_date - last_date).days
             full_interest = _accrue(running_principal, current_rate, interval_days)
             running_accrued += full_interest
-            # Window overlap: only count the days that fall in [period_start, period_end].
             overlap_start = max(last_date, period_start)
             overlap_end = min(event.effective_date, period_end)
             if overlap_end > overlap_start:
                 window_days = (overlap_end - overlap_start).days
-                # The boundary-day exclusion of last_date is built into .days arithmetic.
                 interest_in_period += _accrue(running_principal, current_rate, window_days)
 
         # Step 2: apply the event's effect.
@@ -209,10 +148,27 @@ async def calculate_accrued_interest(
         else:
             delta = _signed_pair_delta(event, lender_id, borrower_id)
             if delta > 0:
-                # Disbursement-equivalent: pure principal growth.
-                running_principal += delta
+                # Determine whether this is a compensating entry reversing a
+                # repayment — if so, apply the inverse waterfall.
+                if (
+                    event.event_type is EventType.COMPENSATING_ENTRY
+                    and event.metadata.get("original_event_type") in _REPAYMENT_TYPES
+                    and event.reverses_event_id is not None
+                    and event.reverses_event_id in pre_repayment_accrued
+                ):
+                    # Inverse waterfall: restore accrued interest first (up to what
+                    # was accrued before the original repayment), then principal.
+                    orig_accrued = pre_repayment_accrued[event.reverses_event_id]
+                    accrued_restored = min(delta, orig_accrued)
+                    running_accrued += accrued_restored
+                    running_principal += delta - accrued_restored
+                else:
+                    # Normal disbursement-equivalent: pure principal growth.
+                    running_principal += delta
             elif delta < 0:
                 # Repayment-equivalent: interest-first waterfall.
+                # Record state BEFORE the waterfall for inverse-waterfall lookup.
+                pre_repayment_accrued[event.id] = running_accrued
                 payment = -delta
                 if payment <= running_accrued:
                     running_accrued -= payment
@@ -231,6 +187,45 @@ async def calculate_accrued_interest(
             interest_in_period += _accrue(running_principal, current_rate, tail_days)
 
     return interest_in_period
+
+
+# -----------------------------------------------------------------------------
+# Spec: docs/business-logic/interpersonal-loans.md#accrual-math---chosen-approach
+# -----------------------------------------------------------------------------
+async def calculate_accrued_interest(
+    lender_id: uuid.UUID,
+    borrower_id: uuid.UUID,
+    period_start: date,
+    period_end: date,
+    db: Any,
+) -> Decimal:
+    """
+    Total simple interest accrued on the (lender, borrower) loan within
+    `[period_start, period_end]` (both inclusive at the day level).
+
+    Spec: docs/business-logic/interpersonal-loans.md
+
+    Fetches all pair events up to `period_end` and delegates to the pure
+    `_accrue_interest_from_events` engine.
+    """
+    rows = await db.fetch(
+        f"""
+        SELECT {_EVENT_COLUMNS}
+          FROM events
+         WHERE effective_date <= $3
+           AND target_owner_id IS NOT NULL
+           AND (
+                (actor_owner_id = $1 AND target_owner_id = $2)
+             OR (actor_owner_id = $2 AND target_owner_id = $1)
+           )
+         ORDER BY effective_date ASC, recorded_at ASC
+        """,
+        lender_id,
+        borrower_id,
+        period_end,
+    )
+    events = [_row_to_event(row) for row in rows]
+    return _accrue_interest_from_events(events, lender_id, borrower_id, period_start, period_end)
 
 
 # -----------------------------------------------------------------------------
@@ -280,22 +275,22 @@ async def generate_fy_statement(
     of `fy_start - 1 day` (no interest layered in — opening reflects pure
     principal). Monthly breakdown rows include zero-activity months so the
     rendered statement always has 12 rows.
-    """
-    # Local import to avoid a cyclic top-level import (balance imports interest).
-    from core.balance import get_interpersonal_balance
 
+    Implementation note: a single DB fetch retrieves ALL pair events up to
+    `fy_end`. Opening/closing balances, per-month accrual, and per-month
+    closing balances are then computed in-memory — no per-month DB round
+    trips. This keeps the function at O(1) DB calls regardless of the number
+    of months.
+    """
     fy_start, fy_end = _fy_bounds(financial_year, calendar)
     day_before_start = fy_start - timedelta(days=1)
 
-    opening_balance = await get_interpersonal_balance(lender_id, borrower_id, day_before_start, db)
-    closing_balance = await get_interpersonal_balance(lender_id, borrower_id, fy_end, db)
-
-    # Pull every event in the FY for the audit list and per-month grouping.
-    rows = await db.fetch(
+    # Single fetch: all pair events from inception up to fy_end.
+    all_rows = await db.fetch(
         f"""
         SELECT {_EVENT_COLUMNS}
           FROM events
-         WHERE effective_date BETWEEN $3 AND $4
+         WHERE effective_date <= $3
            AND target_owner_id IS NOT NULL
            AND (
                 (actor_owner_id = $1 AND target_owner_id = $2)
@@ -305,15 +300,25 @@ async def generate_fy_statement(
         """,
         lender_id,
         borrower_id,
-        fy_start,
         fy_end,
     )
-    events = [_row_to_event(row) for row in rows]
+    all_events = [_row_to_event(row) for row in all_rows]
+
+    # Partition: events inside the FY window for audit list and totals.
+    fy_events = [e for e in all_events if fy_start <= e.effective_date <= fy_end]
+
+    # Opening and closing balances (principal only, computed in-memory).
+    opening_balance = _events_to_pair_balance(
+        [e for e in all_events if e.effective_date <= day_before_start],
+        lender_id,
+        borrower_id,
+    )
+    closing_balance = _events_to_pair_balance(all_events, lender_id, borrower_id)
 
     total_disbursed = Decimal("0")
     total_repaid = Decimal("0")
     audit_events: list[dict[str, Any]] = []
-    for event in events:
+    for event in fy_events:
         delta = _signed_pair_delta(event, lender_id, borrower_id)
         if delta > 0:
             total_disbursed += delta
@@ -328,28 +333,35 @@ async def generate_fy_statement(
             }
         )
 
-    total_interest = await calculate_accrued_interest(lender_id, borrower_id, fy_start, fy_end, db)
+    total_interest = _accrue_interest_from_events(
+        all_events, lender_id, borrower_id, fy_start, fy_end
+    )
 
-    # Monthly breakdown: enumerate every month in the FY, even zero-activity ones.
+    # Monthly breakdown: O(N×M) CPU, zero extra DB calls.
     monthly: list[dict[str, Any]] = []
     cursor = fy_start
     prev_close = opening_balance
     while cursor <= fy_end:
         month_end = min(_last_day_of_month(cursor), fy_end)
-        # Per-month disbursements / repayments by walking events in the window.
+
+        # Events within this month (subset of fy_events already in memory).
+        month_events = [e for e in fy_events if cursor <= e.effective_date <= month_end]
         month_disbursed = Decimal("0")
         month_repaid = Decimal("0")
-        for event in events:
-            if cursor <= event.effective_date <= month_end:
-                d = _signed_pair_delta(event, lender_id, borrower_id)
-                if d > 0:
-                    month_disbursed += d
-                elif d < 0:
-                    month_repaid += -d
-        month_interest = await calculate_accrued_interest(
-            lender_id, borrower_id, cursor, month_end, db
+        for event in month_events:
+            d = _signed_pair_delta(event, lender_id, borrower_id)
+            if d > 0:
+                month_disbursed += d
+            elif d < 0:
+                month_repaid += -d
+
+        # Interest and closing balance from pre-fetched events, no extra I/O.
+        events_to_month_end = [e for e in all_events if e.effective_date <= month_end]
+        month_interest = _accrue_interest_from_events(
+            events_to_month_end, lender_id, borrower_id, cursor, month_end
         )
-        month_close = await get_interpersonal_balance(lender_id, borrower_id, month_end, db)
+        month_close = _events_to_pair_balance(events_to_month_end, lender_id, borrower_id)
+
         monthly.append(
             {
                 "month": f"{cursor.year:04d}-{cursor.month:02d}",

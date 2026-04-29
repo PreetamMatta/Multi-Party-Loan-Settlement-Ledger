@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from _fakes import FakeConnection, event_to_row
@@ -725,6 +726,66 @@ async def test_row_to_event_handles_null_metadata(make_event):
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [row])
     assert await get_interpersonal_balance(lender, borrower, date(2026, 6, 1), db) == Decimal("100")
+
+
+async def test_project_exit_scenario_respects_explicit_as_of_date(monkeypatch):
+    """
+    project_exit_scenario must honour an explicit `as_of_date` and thread it
+    through to get_owner_contributions and get_interpersonal_balance. Passing
+    a far-future date and verifying the sub-call receives it confirms the
+    time-travel contract (Projection Contract §2) is satisfied — the function
+    must never silently use date.today().
+    """
+    owner_id, property_id = uuid.uuid4(), uuid.uuid4()
+    received_as_of: list[date] = []
+
+    async def _capex_recorder(
+        _owner_id: uuid.UUID,
+        _property_id: uuid.UUID,
+        as_of_date: date,
+        _db: Any,
+    ) -> dict[str, Any]:
+        received_as_of.append(as_of_date)
+        return {
+            "capex_inr": Decimal("0"),
+            "opex_inr": Decimal("0"),
+            "total_inr": Decimal("0"),
+            "event_count": 0,
+        }
+
+    monkeypatch.setattr("core.balance.get_owner_contributions", _capex_recorder)
+
+    db = FakeConnection()
+    db.on_fetchval("FROM owners WHERE id", Decimal("50"))
+    db.on_fetch("DISTINCT counterparty", [])
+
+    target_date = date(2025, 12, 31)
+    await project_exit_scenario(
+        owner_id, property_id, Decimal("1000000"), db, as_of_date=target_date
+    )
+    assert received_as_of == [target_date], (
+        "as_of_date was not threaded through to get_owner_contributions"
+    )
+
+
+async def test_project_exit_scenario_rejects_blend_weights_not_summing_to_one(monkeypatch):
+    """
+    blend_weight_contribution + blend_weight_market must equal exactly 1.
+    A ValueError is raised immediately so callers cannot produce a silently
+    wrong financial answer from mismatched weights.
+    """
+    owner_id, property_id = uuid.uuid4(), uuid.uuid4()
+    db = FakeConnection()
+
+    with pytest.raises(ValueError, match="blend_weight_contribution.*blend_weight_market"):
+        await project_exit_scenario(
+            owner_id,
+            property_id,
+            Decimal("1000000"),
+            db,
+            blend_weight_contribution=Decimal("0.3"),
+            blend_weight_market=Decimal("0.3"),  # sums to 0.6, not 1
+        )
 
 
 # Sanity: keep an unused-import warning quiet for fields like recorded_at.
