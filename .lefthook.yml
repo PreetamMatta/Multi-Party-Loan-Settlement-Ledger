@@ -7,11 +7,11 @@ pre-commit:
   commands:
     ruff-format:
       glob: "backend/**/*.py"
-      run: cd backend && .venv/bin/ruff format . --check
+      run: cd backend && uv run ruff format .
       skip_output: false
     ruff-lint:
       glob: "backend/**/*.py"
-      run: cd backend && .venv/bin/ruff check . --fix
+      run: cd backend && uv run ruff check . --fix
       skip_output: false
     ty-check:
       glob: "backend/**/*.py"
@@ -20,6 +20,9 @@ pre-commit:
 
 pre-push:
   commands:
+    ruff-format-check:
+      run: cd backend && uv run ruff format . --check
+      skip_output: false
     pytest:
-      run: cd backend && .venv/bin/pytest --cov=core --cov-report=term-missing --cov-fail-under=95
+      run: cd backend && uv run pytest --cov=core --cov-report=term-missing --cov-fail-under=95
       skip_output: false

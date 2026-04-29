@@ -367,9 +367,7 @@ async def project_exit_scenario(
             credits_due += owed_to_owner
 
     buyout_net_contribution = capex - debts_owed + credits_due
-    buyout_market_value_share = (
-        market_value_property_currency * equity_pct / Decimal("100")
-    )
+    buyout_market_value_share = market_value_property_currency * equity_pct / Decimal("100")
     buyout_weighted_blend = (
         blend_weight_contribution * buyout_net_contribution
         + blend_weight_market * buyout_market_value_share
@@ -417,9 +415,7 @@ async def get_interpersonal_balance_with_interest(
     # window when we want everything-to-date, but `calculate_accrued_interest`
     # is parameterized as `[period_start, period_end]` so we use a far-past
     # sentinel and let the engine itself find the first event.
-    accrued = await calculate_accrued_interest(
-        lender_id, borrower_id, date.min, as_of_date, db
-    )
+    accrued = await calculate_accrued_interest(lender_id, borrower_id, date.min, as_of_date, db)
     return {
         "lender_id": lender_id,
         "borrower_id": borrower_id,

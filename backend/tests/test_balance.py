@@ -29,6 +29,7 @@ from core.events import EventType
 # get_interpersonal_balance
 # -----------------------------------------------------------------------------
 
+
 async def test_balance_is_zero_with_no_events():
     """No events for the pair → balance is exactly Decimal('0')."""
     db = FakeConnection()
@@ -251,6 +252,7 @@ async def test_balance_is_principal_only_no_interest(make_event):
 # get_loan_balance
 # -----------------------------------------------------------------------------
 
+
 async def test_loan_balance_equals_principal_before_any_payment():
     """Fresh loan, no payments → outstanding equals original principal."""
     loan_id = uuid.uuid4()
@@ -340,6 +342,7 @@ async def test_fully_repaid_loan_returns_zero(make_event):
 # -----------------------------------------------------------------------------
 # get_owner_contributions
 # -----------------------------------------------------------------------------
+
 
 async def test_contribution_event_counted_in_capex(make_event):
     """A same-currency CONTRIBUTION credits CapEx by amount_property_currency."""
@@ -468,6 +471,7 @@ async def test_contributions_only_counted_for_actor_owner(make_event):
 # -----------------------------------------------------------------------------
 # project_exit_scenario
 # -----------------------------------------------------------------------------
+
 
 async def test_buyout_2_equals_equity_pct_of_market_value(monkeypatch):
     """Market-value buyout = market_value × (equity_pct / 100), to the cent."""
@@ -606,6 +610,7 @@ async def test_interpersonal_credit_increases_buyout_1(monkeypatch):
 # common-case tests skip past.
 # -----------------------------------------------------------------------------
 
+
 async def test_loan_balance_returns_zero_for_unknown_loan():
     """If the loan does not exist, the function returns Decimal('0') rather than raising."""
     db = FakeConnection()
@@ -719,9 +724,7 @@ async def test_row_to_event_handles_null_metadata(make_event):
     row["metadata"] = None
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [row])
-    assert await get_interpersonal_balance(lender, borrower, date(2026, 6, 1), db) == Decimal(
-        "100"
-    )
+    assert await get_interpersonal_balance(lender, borrower, date(2026, 6, 1), db) == Decimal("100")
 
 
 # Sanity: keep an unused-import warning quiet for fields like recorded_at.

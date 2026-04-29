@@ -45,21 +45,25 @@ async def test_scenario_v_fronts_emi_for_p(db):
     Both projection paths must reflect the result.
     """
     prop = await make_property(db)
-    v = await make_owner(db, prop, name="V", email="v@example.com",
-                         equity_pct=Decimal("50"))
-    p = await make_owner(db, prop, name="P", email="p@example.com",
-                         equity_pct=Decimal("50"))
+    v = await make_owner(db, prop, name="V", email="v@example.com", equity_pct=Decimal("50"))
+    p = await make_owner(db, prop, name="P", email="p@example.com", equity_pct=Decimal("50"))
 
     contrib = event(
-        property_id=prop, event_type=EventType.CONTRIBUTION, actor=v,
-        amount=Decimal("15000"), effective_date=date(2026, 5, 15),
+        property_id=prop,
+        event_type=EventType.CONTRIBUTION,
+        actor=v,
+        amount=Decimal("15000"),
+        effective_date=date(2026, 5, 15),
         description="V's contribution to fund May EMI",
     )
     await insert_event(db, contrib)
 
     disb = event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
-        actor=v, target=p, amount=Decimal("15000"),
+        property_id=prop,
+        event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+        actor=v,
+        target=p,
+        amount=Decimal("15000"),
         effective_date=date(2026, 5, 15),
         description="V fronted P's share of May EMI",
         recorded_at=datetime(2026, 5, 15, 13, tzinfo=UTC),
@@ -77,25 +81,44 @@ async def test_scenario_partial_repayment_and_settlement(db):
     Net debt P→V is ₹25k.
     """
     prop = await make_property(db)
-    v = await make_owner(db, prop, name="V", email="v@example.com",
-                         equity_pct=Decimal("50"))
-    p = await make_owner(db, prop, name="P", email="p@example.com",
-                         equity_pct=Decimal("50"))
+    v = await make_owner(db, prop, name="V", email="v@example.com", equity_pct=Decimal("50"))
+    p = await make_owner(db, prop, name="P", email="p@example.com", equity_pct=Decimal("50"))
 
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
-        actor=v, target=p, amount=Decimal("50000"), effective_date=date(2026, 5, 1),
-    ))
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
-        actor=p, target=v, amount=Decimal("20000"), effective_date=date(2026, 7, 1),
-    ))
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.SETTLEMENT,
-        actor=p, target=v, amount=Decimal("5000"), effective_date=date(2026, 8, 1),
-        description="P covered V's dinner in Mumbai",
-        metadata={"method": "dinner", "city": "Mumbai"},
-    ))
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+            actor=v,
+            target=p,
+            amount=Decimal("50000"),
+            effective_date=date(2026, 5, 1),
+        ),
+    )
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
+            actor=p,
+            target=v,
+            amount=Decimal("20000"),
+            effective_date=date(2026, 7, 1),
+        ),
+    )
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.SETTLEMENT,
+            actor=p,
+            target=v,
+            amount=Decimal("5000"),
+            effective_date=date(2026, 8, 1),
+            description="P covered V's dinner in Mumbai",
+            metadata={"method": "dinner", "city": "Mumbai"},
+        ),
+    )
 
     assert await get_interpersonal_balance(v, p, date(2026, 9, 1), db) == Decimal("25000")
 
@@ -108,14 +131,15 @@ async def test_scenario_compensating_entry_corrects_error(db):
     balance.
     """
     prop = await make_property(db)
-    v = await make_owner(db, prop, name="V", email="v@example.com",
-                         equity_pct=Decimal("50"))
-    p = await make_owner(db, prop, name="P", email="p@example.com",
-                         equity_pct=Decimal("50"))
+    v = await make_owner(db, prop, name="V", email="v@example.com", equity_pct=Decimal("50"))
+    p = await make_owner(db, prop, name="P", email="p@example.com", equity_pct=Decimal("50"))
 
     bad = event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
-        actor=v, target=p, amount=Decimal("10000"),
+        property_id=prop,
+        event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+        actor=v,
+        target=p,
+        amount=Decimal("10000"),
         effective_date=date(2026, 6, 15),
         description="Bad: should have been ₹1,000",
     )
@@ -136,8 +160,11 @@ async def test_scenario_compensating_entry_corrects_error(db):
     await insert_event(db, comp)
 
     corrected = event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
-        actor=v, target=p, amount=Decimal("1000"),
+        property_id=prop,
+        event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+        actor=v,
+        target=p,
+        amount=Decimal("1000"),
         effective_date=date(2026, 6, 15),  # original effective_date
         description="Correct disbursement — re-issued after compensating bad row.",
         recorded_at=datetime(2026, 6, 19, 9, 5, tzinfo=UTC),
@@ -150,7 +177,8 @@ async def test_scenario_compensating_entry_corrects_error(db):
     # The bad and compensating rows BOTH still exist in the events table.
     surviving = await db.fetchval(
         "SELECT COUNT(*) FROM events WHERE id IN ($1, $2)",
-        bad_id, comp.id,
+        bad_id,
+        comp.id,
     )
     assert surviving == 2
 
@@ -161,23 +189,42 @@ async def test_scenario_as_of_date_time_travel(db):
     land, the balance steps down through the timeline.
     """
     prop = await make_property(db)
-    v = await make_owner(db, prop, name="V", email="v@example.com",
-                         equity_pct=Decimal("50"))
-    p = await make_owner(db, prop, name="P", email="p@example.com",
-                         equity_pct=Decimal("50"))
+    v = await make_owner(db, prop, name="V", email="v@example.com", equity_pct=Decimal("50"))
+    p = await make_owner(db, prop, name="P", email="p@example.com", equity_pct=Decimal("50"))
 
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
-        actor=v, target=p, amount=Decimal("30000"), effective_date=date(2026, 1, 1),
-    ))
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
-        actor=p, target=v, amount=Decimal("10000"), effective_date=date(2026, 2, 1),
-    ))
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
-        actor=p, target=v, amount=Decimal("10000"), effective_date=date(2026, 3, 1),
-    ))
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+            actor=v,
+            target=p,
+            amount=Decimal("30000"),
+            effective_date=date(2026, 1, 1),
+        ),
+    )
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
+            actor=p,
+            target=v,
+            amount=Decimal("10000"),
+            effective_date=date(2026, 2, 1),
+        ),
+    )
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_LOAN_REPAYMENT,
+            actor=p,
+            target=v,
+            amount=Decimal("10000"),
+            effective_date=date(2026, 3, 1),
+        ),
+    )
 
     assert await get_interpersonal_balance(v, p, date(2025, 12, 31), db) == Decimal("0")
     assert await get_interpersonal_balance(v, p, date(2026, 1, 31), db) == Decimal("30000")
@@ -192,26 +239,35 @@ async def test_scenario_interest_accrual_end_to_end(db):
     6% on ₹100,000, and zero for the Jan-Mar zero-rate period.
     """
     prop = await make_property(db)
-    v = await make_owner(db, prop, name="V", email="v@example.com",
-                         equity_pct=Decimal("50"))
-    p = await make_owner(db, prop, name="P", email="p@example.com",
-                         equity_pct=Decimal("50"))
+    v = await make_owner(db, prop, name="V", email="v@example.com", equity_pct=Decimal("50"))
+    p = await make_owner(db, prop, name="P", email="p@example.com", equity_pct=Decimal("50"))
 
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
-        actor=v, target=p, amount=Decimal("100000"), effective_date=date(2026, 1, 1),
-    ))
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.INTERPERSONAL_RATE_CHANGE,
-        actor=v, target=p, effective_date=date(2026, 4, 1),
-        metadata={"new_rate_pct": "6.0", "previous_rate_pct": "0.0"},
-        description="Switch to 6% p.a.",
-    ))
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
+            actor=v,
+            target=p,
+            amount=Decimal("100000"),
+            effective_date=date(2026, 1, 1),
+        ),
+    )
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.INTERPERSONAL_RATE_CHANGE,
+            actor=v,
+            target=p,
+            effective_date=date(2026, 4, 1),
+            metadata={"new_rate_pct": "6.0", "previous_rate_pct": "0.0"},
+            description="Switch to 6% p.a.",
+        ),
+    )
 
     # 91 days from Apr 1 to Jul 1, on ₹100,000 at 6%.
-    expected = (
-        Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("91") / Decimal("365")
-    )
+    expected = Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("91") / Decimal("365")
     result = await calculate_accrued_interest(v, p, date(2026, 1, 1), date(2026, 7, 1), db)
     assert result == expected
 
@@ -226,8 +282,7 @@ async def test_scenario_loan_balance_decreases_via_emi_principal(db):
     Outstanding equals 1,000,000 − 35,000 (interest doesn't reduce principal).
     """
     prop = await make_property(db)
-    payer = await make_owner(db, prop, name="V", email="v@example.com",
-                             equity_pct=Decimal("100"))
+    payer = await make_owner(db, prop, name="V", email="v@example.com", equity_pct=Decimal("100"))
     loan = await make_bank_loan(db, prop, principal=Decimal("1000000"))
 
     # Insert an emi_schedule row marked paid — what the projection sees as
@@ -239,19 +294,31 @@ async def test_scenario_loan_balance_decreases_via_emi_principal(db):
             total_emi, status, paid_at, paid_by_owner_id
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         """,
-        loan, date(2026, 5, 15), Decimal("35000"), Decimal("15000"),
-        Decimal("50000"), "paid", datetime(2026, 5, 15, 12, tzinfo=UTC), payer,
+        loan,
+        date(2026, 5, 15),
+        Decimal("35000"),
+        Decimal("15000"),
+        Decimal("50000"),
+        "paid",
+        datetime(2026, 5, 15, 12, tzinfo=UTC),
+        payer,
     )
     # Plus the corresponding event.
-    await insert_event(db, event(
-        property_id=prop, event_type=EventType.EMI_PAYMENT,
-        actor=payer, loan_id=loan, amount=Decimal("50000"),
-        effective_date=date(2026, 5, 15),
-        metadata={
-            "principal_component": "35000",
-            "interest_component": "15000",
-            "emi_schedule_id": "00000000-0000-0000-0000-000000000000",
-        },
-    ))
+    await insert_event(
+        db,
+        event(
+            property_id=prop,
+            event_type=EventType.EMI_PAYMENT,
+            actor=payer,
+            loan_id=loan,
+            amount=Decimal("50000"),
+            effective_date=date(2026, 5, 15),
+            metadata={
+                "principal_component": "35000",
+                "interest_component": "15000",
+                "emi_schedule_id": "00000000-0000-0000-0000-000000000000",
+            },
+        ),
+    )
 
     assert await get_loan_balance(loan, date(2026, 6, 1), db) == Decimal("965000")

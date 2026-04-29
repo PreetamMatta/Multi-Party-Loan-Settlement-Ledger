@@ -287,12 +287,8 @@ async def generate_fy_statement(
     fy_start, fy_end = _fy_bounds(financial_year, calendar)
     day_before_start = fy_start - timedelta(days=1)
 
-    opening_balance = await get_interpersonal_balance(
-        lender_id, borrower_id, day_before_start, db
-    )
-    closing_balance = await get_interpersonal_balance(
-        lender_id, borrower_id, fy_end, db
-    )
+    opening_balance = await get_interpersonal_balance(lender_id, borrower_id, day_before_start, db)
+    closing_balance = await get_interpersonal_balance(lender_id, borrower_id, fy_end, db)
 
     # Pull every event in the FY for the audit list and per-month grouping.
     rows = await db.fetch(
@@ -332,9 +328,7 @@ async def generate_fy_statement(
             }
         )
 
-    total_interest = await calculate_accrued_interest(
-        lender_id, borrower_id, fy_start, fy_end, db
-    )
+    total_interest = await calculate_accrued_interest(lender_id, borrower_id, fy_start, fy_end, db)
 
     # Monthly breakdown: enumerate every month in the FY, even zero-activity ones.
     monthly: list[dict[str, Any]] = []
@@ -355,9 +349,7 @@ async def generate_fy_statement(
         month_interest = await calculate_accrued_interest(
             lender_id, borrower_id, cursor, month_end, db
         )
-        month_close = await get_interpersonal_balance(
-            lender_id, borrower_id, month_end, db
-        )
+        month_close = await get_interpersonal_balance(lender_id, borrower_id, month_end, db)
         monthly.append(
             {
                 "month": f"{cursor.year:04d}-{cursor.month:02d}",

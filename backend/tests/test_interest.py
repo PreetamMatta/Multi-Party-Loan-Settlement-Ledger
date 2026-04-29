@@ -23,6 +23,7 @@ from core.interest import calculate_accrued_interest, generate_fy_statement
 # Helpers
 # -----------------------------------------------------------------------------
 
+
 def _disbursement(make_event, *, lender, borrower, amount, on: date):
     return make_event(
         event_type=EventType.INTERPERSONAL_LOAN_DISBURSEMENT,
@@ -63,11 +64,13 @@ def _rate_change(make_event, *, lender, borrower, new_rate_pct, on: date):
 # calculate_accrued_interest
 # -----------------------------------------------------------------------------
 
+
 async def test_zero_rate_returns_zero_interest(make_event):
     """Default 0% rate means no interest, regardless of days elapsed."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(disb)])
     result = await calculate_accrued_interest(
@@ -79,10 +82,12 @@ async def test_zero_rate_returns_zero_interest(make_event):
 async def test_simple_interest_single_period(make_event):
     """₹100,000 at 6% for 91 days = 100,000 * 6/100 * 91/365 (exact Decimal)."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
     db = FakeConnection()
     # The rate change is recorded same day with later recorded_at. Order: disb, rate.
     rate_row = event_to_row(rate)
@@ -92,19 +97,19 @@ async def test_simple_interest_single_period(make_event):
         lender, borrower, date(2026, 1, 1), date(2026, 4, 2), db
     )
     # Jan 1 → Apr 2 = 91 days at 6% on ₹100,000.
-    expected = (
-        Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("91") / Decimal("365")
-    )
+    expected = Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("91") / Decimal("365")
     assert result == expected
 
 
 async def test_interest_does_not_accrue_on_day_of_disbursement(make_event):
     """Disbursement on day D, queried as of day D → zero interest."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 4, 1))
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 4, 1)
+    )
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
     db = FakeConnection()
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
@@ -118,10 +123,12 @@ async def test_interest_does_not_accrue_on_day_of_disbursement(make_event):
 async def test_interest_accrues_from_day_after_disbursement(make_event):
     """One day post-disbursement → exactly one day of accrual, not two."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2026, 1, 1))
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 4, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 4, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
     db = FakeConnection()
@@ -136,19 +143,19 @@ async def test_interest_accrues_from_day_after_disbursement(make_event):
 async def test_rate_change_applies_forward_only(make_event):
     """Pre-rate-change days at the old (zero) rate must contribute no interest."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2026, 4, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 4, 1)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(disb), event_to_row(rate)])
     # From Jan 1 to Mar 31: 0% (no interest). From Apr 1 to Jul 1: 6% over 91 days.
     result = await calculate_accrued_interest(
         lender, borrower, date(2026, 1, 1), date(2026, 7, 1), db
     )
-    expected = (
-        Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("91") / Decimal("365")
-    )
+    expected = Decimal("100000") * Decimal("6") / Decimal("100") * Decimal("91") / Decimal("365")
     assert result == expected
 
 
@@ -158,10 +165,12 @@ async def test_rate_change_does_not_retroactively_change_accrued_interest(make_e
     yields zero (old 0% rate) regardless of whatever rate exists later.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="9.0", on=date(2026, 4, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="9.0", on=date(2026, 4, 1)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(disb), event_to_row(rate)])
     # Querying only the pre-rate-change window: result is zero, even though
@@ -183,16 +192,19 @@ async def test_repayment_reduces_principal_for_future_accrual(make_event):
     the engine sees: zero-rate period → repay → rate change → 12% period.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     # Repayment recorded at 09:00 — before the rate change.
-    repay = _repayment(make_event, lender=lender, borrower=borrower,
-                       amount="50000", on=date(2026, 4, 1))
+    repay = _repayment(
+        make_event, lender=lender, borrower=borrower, amount="50000", on=date(2026, 4, 1)
+    )
     repay_row = event_to_row(repay)
     repay_row["recorded_at"] = datetime(2026, 4, 1, 9, 0, tzinfo=UTC)
     # Rate change recorded at 10:00 — after the repayment.
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="12.0", on=date(2026, 4, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="12.0", on=date(2026, 4, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2026, 4, 1, 10, 0, tzinfo=UTC)
     db = FakeConnection()
@@ -204,9 +216,7 @@ async def test_repayment_reduces_principal_for_future_accrual(make_event):
     # Apr 1: repay 50k → all to principal (no accrued). Principal = 50,000.
     # Apr 1: rate → 12%.
     # Apr 1 → Dec 31: 274 days at 12% on 50,000 = 50000 * 12/100 * 274/365.
-    expected = (
-        Decimal("50000") * Decimal("12") / Decimal("100") * Decimal("274") / Decimal("365")
-    )
+    expected = Decimal("50000") * Decimal("12") / Decimal("100") * Decimal("274") / Decimal("365")
     result = await calculate_accrued_interest(
         lender, borrower, date(2026, 1, 1), date(2026, 12, 31), db
     )
@@ -230,25 +240,26 @@ async def test_repayment_applied_interest_first_then_principal(make_event):
     and the tail interest would differ. The assert detects either error.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="12.0", on=date(2026, 1, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="12.0", on=date(2026, 1, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     disb_row = event_to_row(disb)
     disb_row["recorded_at"] = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
-    repay = _repayment(make_event, lender=lender, borrower=borrower,
-                       amount="10000", on=date(2026, 7, 1))
+    repay = _repayment(
+        make_event, lender=lender, borrower=borrower, amount="10000", on=date(2026, 7, 1)
+    )
     db = FakeConnection()
     db.on_fetch(
         "target_owner_id IS NOT NULL",
         [rate_row, disb_row, event_to_row(repay)],
     )
     # First period: 181 days on 100k at 12%.
-    first = (
-        Decimal("100000") * Decimal("12") / Decimal("100") * Decimal("181") / Decimal("365")
-    )
+    first = Decimal("100000") * Decimal("12") / Decimal("100") * Decimal("181") / Decimal("365")
     # Repay of 10k absorbs `first` of interest, remainder reduces principal:
     principal_after = Decimal("100000") - (Decimal("10000") - first)
     # Tail: 1 day at 12% on principal_after.
@@ -263,10 +274,12 @@ async def test_repayment_applied_interest_first_then_principal(make_event):
 async def test_partial_period_uses_actual_over_365(make_event):
     """A 45-day window must produce 45/365 of the annual rate, exactly."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2026, 1, 1))
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
     db = FakeConnection()
@@ -287,10 +300,12 @@ async def test_leap_year_uses_365_not_366(make_event):
     actual/actual, this test will fail and force a doc + decision update.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2024, 1, 1))
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2024, 1, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2024, 1, 1)
+    )
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2024, 1, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2024, 1, 1, 9, 0, tzinfo=UTC)
     db = FakeConnection()
@@ -312,6 +327,7 @@ async def test_leap_year_uses_365_not_366(make_event):
 # -----------------------------------------------------------------------------
 # generate_fy_statement
 # -----------------------------------------------------------------------------
+
 
 async def test_fy_statement_IN_calendar_correct_date_range(make_event):
     """Indian FY 2026 = April 1 2026 → March 31 2027."""
@@ -340,8 +356,9 @@ async def test_fy_statement_opening_balance_matches_prior_period(make_event):
     a year earlier shows up as the opening balance.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    earlier = _disbursement(make_event, lender=lender, borrower=borrower,
-                            amount="50000", on=date(2025, 6, 1))
+    earlier = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="50000", on=date(2025, 6, 1)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(earlier)])
     result = await generate_fy_statement(lender, borrower, 2026, db, calendar="IN")
@@ -363,8 +380,9 @@ async def test_monthly_breakdown_covers_all_12_months(make_event):
 async def test_monthly_breakdown_zero_activity_months_included(make_event):
     """A month with no events appears with zeros, not omitted."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    only = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="10000", on=date(2026, 4, 15))
+    only = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="10000", on=date(2026, 4, 15)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(only)])
     result = await generate_fy_statement(lender, borrower, 2026, db, calendar="IN")
@@ -378,8 +396,9 @@ async def test_monthly_breakdown_zero_activity_months_included(make_event):
 async def test_fy_statement_events_list_contains_only_fy_events(make_event):
     """The audit `events` list is bounded by the FY window."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    in_fy = _disbursement(make_event, lender=lender, borrower=borrower,
-                          amount="10000", on=date(2026, 6, 1))
+    in_fy = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="10000", on=date(2026, 6, 1)
+    )
     # The fetcher returns all events in the FY range — the function does
     # not double-filter, but it also won't include rows outside the window
     # because the SQL filter uses BETWEEN.
@@ -394,6 +413,7 @@ async def test_fy_statement_events_list_contains_only_fy_events(make_event):
 # -----------------------------------------------------------------------------
 # Coverage extras
 # -----------------------------------------------------------------------------
+
 
 async def test_unsupported_calendar_raises():
     """`generate_fy_statement` rejects unknown calendar values explicitly."""
@@ -417,8 +437,9 @@ async def test_rate_change_with_decimal_metadata(make_event):
         # Decimal-passthrough branch.
         metadata={"new_rate_pct": Decimal("4.5")},
     )
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     disb_row = event_to_row(disb)
     disb_row["recorded_at"] = datetime(2026, 1, 1, 10, tzinfo=UTC)
     db = FakeConnection()
@@ -426,9 +447,7 @@ async def test_rate_change_with_decimal_metadata(make_event):
     result = await calculate_accrued_interest(
         lender, borrower, date(2026, 1, 1), date(2026, 1, 366 if False else 31), db
     )
-    expected = (
-        Decimal("100000") * Decimal("4.5") / Decimal("100") * Decimal("30") / Decimal("365")
-    )
+    expected = Decimal("100000") * Decimal("4.5") / Decimal("100") * Decimal("30") / Decimal("365")
     assert result == expected
 
 
@@ -444,8 +463,9 @@ async def test_rate_change_with_missing_metadata_is_no_op(make_event):
         recorded_at=datetime(2026, 1, 1, 9, tzinfo=UTC),
         metadata={},  # no new_rate_pct key
     )
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     disb_row = event_to_row(disb)
     disb_row["recorded_at"] = datetime(2026, 1, 1, 10, tzinfo=UTC)
     db = FakeConnection()
@@ -460,13 +480,15 @@ async def test_rate_change_with_missing_metadata_is_no_op(make_event):
 async def test_interest_engine_handles_string_jsonb(make_event):
     """`_row_to_event` inside interest.py coerces str metadata / recorded_at."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="6.0", on=date(2026, 1, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="6.0", on=date(2026, 1, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["metadata"] = '{"new_rate_pct": "6.0"}'
     rate_row["recorded_at"] = "2026-01-01T09:00:00+00:00"
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     disb_row = event_to_row(disb)
     disb_row["recorded_at"] = "2026-01-01T10:00:00+00:00"
     db = FakeConnection()
@@ -485,26 +507,25 @@ async def test_small_repayment_fully_absorbed_by_interest(make_event):
     on the original principal.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    rate = _rate_change(make_event, lender=lender, borrower=borrower,
-                        new_rate_pct="12.0", on=date(2026, 1, 1))
+    rate = _rate_change(
+        make_event, lender=lender, borrower=borrower, new_rate_pct="12.0", on=date(2026, 1, 1)
+    )
     rate_row = event_to_row(rate)
     rate_row["recorded_at"] = datetime(2026, 1, 1, 9, tzinfo=UTC)
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     disb_row = event_to_row(disb)
     disb_row["recorded_at"] = datetime(2026, 1, 1, 10, tzinfo=UTC)
     # 181 days of accrual = ~5950 of accrued interest. Repay only ₹100.
-    tiny_repay = _repayment(make_event, lender=lender, borrower=borrower,
-                            amount="100", on=date(2026, 7, 1))
+    tiny_repay = _repayment(
+        make_event, lender=lender, borrower=borrower, amount="100", on=date(2026, 7, 1)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [rate_row, disb_row, event_to_row(tiny_repay)])
     # Tail: 1 day at 12% on UNCHANGED ₹100,000 (repay was absorbed by interest).
-    first = (
-        Decimal("100000") * Decimal("12") / Decimal("100") * Decimal("181") / Decimal("365")
-    )
-    tail = (
-        Decimal("100000") * Decimal("12") / Decimal("100") * Decimal("1") / Decimal("365")
-    )
+    first = Decimal("100000") * Decimal("12") / Decimal("100") * Decimal("181") / Decimal("365")
+    tail = Decimal("100000") * Decimal("12") / Decimal("100") * Decimal("1") / Decimal("365")
     expected = first + tail
     result = await calculate_accrued_interest(
         lender, borrower, date(2026, 1, 1), date(2026, 7, 2), db
@@ -517,8 +538,9 @@ async def test_period_entirely_before_first_event(make_event):
     If `period_end` falls before the first event, no interest can have accrued.
     """
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    later = _disbursement(make_event, lender=lender, borrower=borrower,
-                          amount="100000", on=date(2026, 6, 1))
+    later = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 6, 1)
+    )
     db = FakeConnection()
     db.on_fetch("target_owner_id IS NOT NULL", [event_to_row(later)])
     result = await calculate_accrued_interest(
@@ -554,10 +576,12 @@ async def test_signed_pair_delta_no_op_event(make_event):
 async def test_fy_statement_totals_disbursed_and_repaid(make_event):
     """The flat totals at the top of an FY statement reflect the full year's activity."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 5, 1))
-    repay = _repayment(make_event, lender=lender, borrower=borrower,
-                       amount="30000", on=date(2026, 9, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 5, 1)
+    )
+    repay = _repayment(
+        make_event, lender=lender, borrower=borrower, amount="30000", on=date(2026, 9, 1)
+    )
     db = FakeConnection()
     rows = [event_to_row(disb), event_to_row(repay)]
     # Same handler matches both the FY events query and the per-pair queries
@@ -574,8 +598,9 @@ async def test_fy_statement_totals_disbursed_and_repaid(make_event):
 async def test_interest_engine_null_metadata_treated_as_empty(make_event):
     """NULL JSONB metadata is treated as `{}` (consistent with balance.py)."""
     lender, borrower = uuid.uuid4(), uuid.uuid4()
-    disb = _disbursement(make_event, lender=lender, borrower=borrower,
-                         amount="100000", on=date(2026, 1, 1))
+    disb = _disbursement(
+        make_event, lender=lender, borrower=borrower, amount="100000", on=date(2026, 1, 1)
+    )
     disb_row = event_to_row(disb)
     disb_row["metadata"] = None
     db = FakeConnection()

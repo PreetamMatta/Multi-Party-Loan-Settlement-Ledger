@@ -125,9 +125,7 @@ async def make_owner(
     return row["id"]
 
 
-async def make_bank_loan(
-    db: Any, property_id: uuid.UUID, *, principal: Decimal
-) -> uuid.UUID:
+async def make_bank_loan(db: Any, property_id: uuid.UUID, *, principal: Decimal) -> uuid.UUID:
     row = await db.fetchrow(
         """
         INSERT INTO bank_loans (
@@ -218,7 +216,9 @@ def event(
         metadata=metadata or {},
         reverses_event_id=reverses_event_id,
         recorded_by="functional-test",
-        recorded_at=recorded_at or datetime(effective_date.year, effective_date.month,
-                                            effective_date.day, 12, 0, tzinfo=UTC),
+        recorded_at=recorded_at
+        or datetime(
+            effective_date.year, effective_date.month, effective_date.day, 12, 0, tzinfo=UTC
+        ),
         effective_date=effective_date,
     )
