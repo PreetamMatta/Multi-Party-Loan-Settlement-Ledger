@@ -788,5 +788,105 @@ async def test_project_exit_scenario_rejects_blend_weights_not_summing_to_one(mo
         )
 
 
+async def test_buyout_2_deducts_bank_loan_share(monkeypatch):
+    """
+    Buyout #2 = market_value * (equity_pct/100) - loan_outstanding * (equity_pct/100).
+
+    Spec: docs/business-logic/exit-scenarios.md#buyout-number-2--market-value-share
+
+    Without the deduction an exiting owner would be paid their equity slice of
+    the gross asset value while the remaining owners absorb their share of the
+    outstanding bank debt — a systematic over-payment to the exiting owner.
+    """
+    owner_id, property_id = uuid.uuid4(), uuid.uuid4()
+    loan_id = uuid.uuid4()
+
+    async def _zero_capex(*_a, **_k):
+        return {
+            "capex_inr": Decimal("0"),
+            "opex_inr": Decimal("0"),
+            "total_inr": Decimal("0"),
+            "event_count": 0,
+        }
+
+    monkeypatch.setattr("core.balance.get_owner_contributions", _zero_capex)
+
+    db = FakeConnection()
+    db.on_fetchval("FROM owners WHERE id", Decimal("33.3333"))
+    db.on_fetch("DISTINCT counterparty", [])
+    # Simulate one active bank loan with outstanding principal queried via get_loan_balance.
+    db.on_fetch("FROM bank_loans WHERE property_id", [{"id": loan_id}])
+    # get_loan_balance: original principal — no payment events, so balance = original.
+    db.on_fetchval("FROM bank_loans WHERE id", Decimal("3000000"))
+    db.on_fetch("FROM events", [])  # no events → no deltas
+
+    market_value = Decimal("18000000")
+    result = await project_exit_scenario(owner_id, property_id, market_value, db)
+
+    equity_pct = Decimal("33.3333") / Decimal("100")
+    expected_market_share = market_value * equity_pct
+    expected_loan_share = Decimal("3000000") * equity_pct
+    expected_buyout_2 = expected_market_share - expected_loan_share
+
+    assert result["buyout_market_value_share"] == expected_buyout_2
+    assert result["inputs"]["total_loan_outstanding_inr"] == Decimal("3000000")
+    assert result["inputs"]["loan_share_inr"] == expected_loan_share
+
+
+async def test_buyout_2_with_no_loans_equals_equity_pct_of_market_value(monkeypatch):
+    """When no bank loans exist the bank-loan deduction is zero — Buyout #2 = equity × market."""
+    owner_id, property_id = uuid.uuid4(), uuid.uuid4()
+
+    async def _zero_capex(*_a, **_k):
+        return {
+            "capex_inr": Decimal("0"),
+            "opex_inr": Decimal("0"),
+            "total_inr": Decimal("0"),
+            "event_count": 0,
+        }
+
+    monkeypatch.setattr("core.balance.get_owner_contributions", _zero_capex)
+
+    db = FakeConnection()
+    db.on_fetchval("FROM owners WHERE id", Decimal("50"))
+    db.on_fetch("DISTINCT counterparty", [])
+    db.on_fetch("FROM bank_loans WHERE property_id", [])  # no loans
+
+    result = await project_exit_scenario(owner_id, property_id, Decimal("10000000"), db)
+
+    assert result["buyout_market_value_share"] == Decimal("5000000")
+    assert result["inputs"]["total_loan_outstanding_inr"] == Decimal("0")
+    assert result["inputs"]["loan_share_inr"] == Decimal("0")
+
+
+async def test_buyout_2_with_fully_repaid_loan_equals_equity_pct_of_market_value(monkeypatch):
+    """A fully repaid loan contributes zero to the deduction — Buyout #2 = equity × market."""
+    owner_id, property_id = uuid.uuid4(), uuid.uuid4()
+    loan_id = uuid.uuid4()
+
+    async def _zero_capex(*_a, **_k):
+        return {
+            "capex_inr": Decimal("0"),
+            "opex_inr": Decimal("0"),
+            "total_inr": Decimal("0"),
+            "event_count": 0,
+        }
+
+    monkeypatch.setattr("core.balance.get_owner_contributions", _zero_capex)
+
+    db = FakeConnection()
+    db.on_fetchval("FROM owners WHERE id", Decimal("50"))
+    db.on_fetch("DISTINCT counterparty", [])
+    db.on_fetch("FROM bank_loans WHERE property_id", [{"id": loan_id}])
+    # get_loan_balance returns 0 for a fully repaid loan.
+    db.on_fetchval("FROM bank_loans WHERE id", Decimal("0"))
+    db.on_fetch("FROM events", [])
+
+    result = await project_exit_scenario(owner_id, property_id, Decimal("10000000"), db)
+
+    assert result["buyout_market_value_share"] == Decimal("5000000")
+    assert result["inputs"]["total_loan_outstanding_inr"] == Decimal("0")
+
+
 # Sanity: keep an unused-import warning quiet for fields like recorded_at.
 _ = (datetime, UTC, pytest)

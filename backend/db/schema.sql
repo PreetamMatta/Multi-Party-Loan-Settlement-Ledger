@@ -359,6 +359,17 @@ WITH pair_events AS (
 
     -- Inbound: actor=borrower repaying target=lender. Normalize to lender→borrower
     -- framing with a negative sign.
+    --
+    -- KNOWN LIMITATION (SETTLEMENT only): this branch assumes actor=borrower and
+    -- target=lender. INTERPERSONAL_LOAN_REPAYMENT always satisfies this by
+    -- definition. SETTLEMENT can also go the reverse direction (actor=lender
+    -- giving value to target=borrower, which INCREASES the borrower's debt).
+    -- The SQL view cannot distinguish the two directions without joining
+    -- interpersonal_loans to determine the canonical pair — it therefore handles
+    -- reverse-direction SETTLEMENT incorrectly (assigns the signed_amount to
+    -- the wrong pair bucket). Callers that may have reverse-direction SETTLEMENTs
+    -- must use the Python function get_interpersonal_balance() instead of querying
+    -- this view directly. See docs/business-logic/computed-views.md.
     SELECT
         e.property_id,
         e.target_owner_id  AS lender_owner_id,

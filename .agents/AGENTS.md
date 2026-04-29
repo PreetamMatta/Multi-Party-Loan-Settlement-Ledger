@@ -98,9 +98,13 @@ These are hard constraints. Violations require an explicit migration discussion 
 Session 1 — Scaffold, docs, schema, backend foundation       ← COMPLETE
 Session 2 — Business logic docs, event log impl + HMAC tests, FX fetcher  ← COMPLETE
 Session 3 — Balance projection engine, interest accrual, computed views   ← COMPLETE
+             (Note: project_exit_scenario Buyout #1 returns NOMINAL capex —
+              CPI inflation adjustment deferred to Session 6. Buyout #2 now
+              correctly deducts outstanding bank loan share per exit-scenarios.md.)
 Session 4 — FastAPI endpoints (contribution, payment, settlement, FX)     ← NEXT
 Session 5 — FastMCP tool surface implementation
-Session 6 — Exit scenario CPI inflation adjustment, per-FY interest UX polish
+Session 6 — Exit scenario CPI inflation adjustment + "CPI not configured" warning,
+             interest_accrued_per_period in FY statements, per-FY interest UX polish
 Session 7 — Frontend (Next.js, TanStack Table, Recharts dashboard)
 Session 8 — Docker prod config, nightly export, Git sync cron
 ```

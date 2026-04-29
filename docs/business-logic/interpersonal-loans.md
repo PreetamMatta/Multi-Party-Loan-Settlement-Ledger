@@ -195,34 +195,52 @@ tax filing. Both jurisdictions the system supports are documented:
 
 ### What's in a statement
 
-For a given (lender, borrower, financial-year):
+For a given (lender, borrower, financial-year), `generate_fy_statement()` returns:
 
-```
+```python
 {
-  "lender_owner_id":          UUID,
-  "borrower_owner_id":        UUID,
-  "jurisdiction":             "IN" | "US",
-  "financial_year":           int,         # the starting year
-  "fy_start":                 date,
-  "fy_end":                   date,
-  "opening_balance":          Decimal,     # principal owed at fy_start
-  "disbursements":            list[event], # all DISBURSEMENT events in the FY
-  "repayments":               list[event], # all REPAYMENT/SETTLEMENT events in the FY
-  "rate_changes":             list[event], # all RATE_CHANGE events in the FY
-  "interest_accrued_per_period": list[
-    {
-      "from": date, "to": date,
-      "rate_pct": Decimal,
-      "principal_at_start": Decimal,
-      "interest": Decimal
-    }
-  ],
-  "total_interest_accrued":   Decimal,
-  "total_disbursements":      Decimal,
-  "total_repayments":         Decimal,
-  "closing_balance":          Decimal      # principal owed at fy_end
+  "lender_id":                    UUID,
+  "borrower_id":                  UUID,
+  "calendar":                     "IN" | "US",   # "IN" = Indian FY (Apr–Mar), "US" = calendar year
+  "financial_year":               int,            # the starting year
+  "fy_start":                     date,
+  "fy_end":                       date,
+  "opening_balance_inr":          Decimal,        # principal owed at fy_start (principal only)
+  "closing_balance_inr":          Decimal,        # principal owed at fy_end (principal only)
+  "total_interest_accrued_inr":   Decimal,
+  "total_disbursed_inr":          Decimal,
+  "total_repaid_inr":             Decimal,
+  "monthly_breakdown":            list[dict],     # one entry per calendar month (always 12 rows)
+  # each monthly_breakdown entry:
+  # {
+  #   "month":            "YYYY-MM",
+  #   "opening_balance":  Decimal,     # principal at month start
+  #   "disbursements":    Decimal,
+  #   "repayments":       Decimal,
+  #   "interest_accrued": Decimal,
+  #   "closing_balance":  Decimal,     # principal at month end
+  # }
+  "events":                       list[dict],     # flat audit list of all FY events
+  # each events entry:
+  # {
+  #   "effective_date": date,
+  #   "event_type":     str,
+  #   "amount_inr":     Decimal,
+  #   "description":    str | None,
+  # }
 }
 ```
+
+> **Note on `interest_accrued_per_period`:** A per-rate-change-period breakdown
+> (showing `{from, to, rate_pct, principal_at_start, interest}` for each
+> rate-constant interval) is planned for Session 6. Until then, use
+> `monthly_breakdown` for a month-level view and `total_interest_accrued_inr`
+> for the FY total. The monthly interest figures are independently verifiable
+> from the accrual math in [Accrual math — chosen approach](#accrual-math--chosen-approach).
+
+> **Note on `opening_balance_inr` / `closing_balance_inr`:** these are
+> **principal only** — they do not include accrued interest. Use
+> `get_interpersonal_balance_with_interest()` for the combined view.
 
 ### Who needs this
 

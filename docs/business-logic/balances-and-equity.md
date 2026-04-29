@@ -244,12 +244,15 @@ async def project_exit_scenario(
     owner_id, property_id, market_value_property_currency, db,
     blend_weight_contribution=Decimal("0.5"),
     blend_weight_market=Decimal("0.5"),
+    as_of_date=None,
 ) -> dict
 ```
 Returns the three buyout numbers (net contribution, market-value share,
-weighted blend), the inputs used, the equity percentage, and the blend
-weights. CPI inflation adjustment for Buyout #1 is reserved for
-Session 6.
+weighted blend), the inputs used, the equity percentage, blend weights,
+and the outstanding loan totals used in Buyout #2. `as_of_date` defaults
+to `date.today()`; pass an explicit date for historical queries or
+deterministic tests. CPI inflation adjustment for Buyout #1 is reserved
+for Session 6.
 
 ```python
 async def get_interpersonal_balance_with_interest(

@@ -54,11 +54,22 @@ IS NOT NULL`:
   positive sign)
 - `INTERPERSONAL_LOAN_REPAYMENT` (actor=borrower, target=lender,
   negative sign)
-- `SETTLEMENT` (actor=payer, target=recipient, negative sign in payer
-  direction)
+- `SETTLEMENT` (actor=payer, target=recipient, negative sign — see
+  limitation note below)
 - `OPEX_SPLIT` (actor=owner-of-share, target=payer, positive sign in
   payer direction)
 - `COMPENSATING_ENTRY` rows that point at any of the above
+
+**Known limitation — reverse-direction SETTLEMENT:** The view assumes
+all SETTLEMENT events follow the standard direction (actor=borrower
+paying target=lender, reducing the borrower's debt). The doc also
+describes a reverse direction where actor=lender gives value to
+target=borrower (increasing the borrower's debt). The view cannot
+distinguish the two directions in SQL without joining `interpersonal_loans`
+to determine canonical pair direction. If your pair has any
+reverse-direction SETTLEMENT events, query
+`get_interpersonal_balance()` (Python) instead — it handles both
+directions correctly via the `get_financial_effect()` router.
 
 **Filter conditions:** none in the view itself. Callers filter by
 `property_id`, `lender_owner_id`, or `borrower_owner_id` on read.
@@ -89,16 +100,14 @@ scan.
 loan's original principal minus the principal components of all
 amortizing and bulk payments made.
 
-**Aggregates:**
-- `bank_loans.principal_inr` (the starting value)
-- `emi_schedule.principal_component` for rows where `status IN ('paid',
-  'prepaid')`
-- `BULK_PREPAYMENT` events against this loan (`amount_property_currency`)
-- `COMPENSATING_ENTRY` rows pointing at any of the above
-
-The interest component of EMIs **does not** reduce principal — it is
-the bank's revenue. Including it would systematically under-state the
-remaining balance.
+**Aggregates (all from the `events` table, not `emi_schedule`):**
+- `bank_loans.principal_inr` (the starting value, joined from `bank_loans`)
+- `events.metadata->>'principal_component'` for `EMI_PAYMENT` events on
+  this loan — the principal-reducing portion only (interest component is
+  the bank's revenue and does not reduce the balance)
+- `events.amount_property_currency` for `BULK_PREPAYMENT` events
+- `COMPENSATING_ENTRY` events pointing at either of the above (carrying
+  already-negated amounts that restore the principal when summed)
 
 **Filter conditions:** none in the view; callers filter by `loan_id`.
 
@@ -106,13 +115,14 @@ remaining balance.
 - `loan_id`
 - `lender_name` — joined from `bank_loans`
 - `original_principal_inr`
-- `total_paid_principal_inr` — sum of paid EMI principal components +
-  bulk prepayments
+- `total_paid_principal_inr` — sum of EMI principal components +
+  bulk prepayments (net of any compensating entries)
 - `outstanding_principal_inr` — clamped at `0` if the math underflows
-- `last_payment_date` — most recent `paid_at::date` for this loan
+- `last_payment_date` — most recent `effective_date` of any payment or
+  prepayment event on this loan (`effective_date`, not `recorded_at`)
 
-**Performance:** trivial join — `bank_loans` is small, the
-`idx_emi_schedule_status` index covers the EMI filter.
+**Performance:** the view scans events filtered to `loan_id IS NOT NULL`
+and the relevant event types; the `idx_events_loan` index covers this.
 
 **Implementation status:** live in `backend/db/schema.sql` (Session 3).
 

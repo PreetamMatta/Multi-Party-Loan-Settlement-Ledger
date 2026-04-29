@@ -83,6 +83,7 @@ Any group of N co-owners — siblings, cousins, friends, partners — who:
 │   ├── core/
 │   │   ├── events.py                  # event model + HMAC + validation + financial-effect routing
 │   │   ├── fx.py                      # dual-rate FX stamping + reference-rate fetch with fallback
+│   │   ├── _db.py                     # shared asyncpg row helpers (Session 3)
 │   │   ├── balance.py                 # balance projection engine (Session 3)
 │   │   └── interest.py                # interpersonal interest accrual (Session 3/6)
 │   ├── tests/                         # pytest suite (test_events, test_fx, test_fx_fetcher, test_balance, test_interest)

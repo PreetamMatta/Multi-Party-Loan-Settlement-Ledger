@@ -224,13 +224,19 @@ async def project_exit_scenario(
 
     Buyout #1 (`buyout_net_contribution`):
         net_capex - debts_owed_to_others + credits_owed_by_others
-        # TODO Session 6: layer CPI inflation adjustment on the capex term
-        # so contributions made in 2026 are compared to today's purchasing
-        # power. v1 returns nominal contribution; that is honest but understates
-        # what the contributor "really" gave up.
+        # TODO Session 6: layer CPI inflation adjustment on the capex term so
+        # contributions made in 2026 are compared to today's purchasing power.
+        # v1 returns NOMINAL contribution with NO "CPI not configured" warning —
+        # this understates the contributor's real outlay. Per exit-scenarios.md,
+        # Session 6 must either implement CPI OR surface an explicit warning.
 
     Buyout #2 (`buyout_market_value_share`):
         market_value * (equity_pct / 100)
+        − equity_pct / 100 * sum(outstanding_principal for each property loan)
+
+        Per exit-scenarios.md: an owner exiting with their equity share cannot
+        claim the full market-value slice without also absorbing their share of
+        the outstanding bank debt. Net of debt, their slice is smaller.
 
     Buyout #3 (`buyout_weighted_blend`):
         weight_c * Buyout1 + weight_m * Buyout2
@@ -299,8 +305,21 @@ async def project_exit_scenario(
         if owed_to_owner > 0:
             credits_due += owed_to_owner
 
+    # Buyout #2: sum outstanding principal on all property bank loans, then
+    # subtract the exiting owner's pro-rata share. Spec: exit-scenarios.md.
+    loan_id_rows = await db.fetch(
+        "SELECT id FROM bank_loans WHERE property_id = $1",
+        property_id,
+    )
+    total_loan_outstanding = Decimal("0")
+    for loan_row in loan_id_rows:
+        total_loan_outstanding += await get_loan_balance(loan_row["id"], as_of_date, db)
+    loan_share_inr = total_loan_outstanding * equity_pct / Decimal("100")
+
     buyout_net_contribution = capex - debts_owed + credits_due
-    buyout_market_value_share = market_value_property_currency * equity_pct / Decimal("100")
+    buyout_market_value_share = (
+        market_value_property_currency * equity_pct / Decimal("100") - loan_share_inr
+    )
     buyout_weighted_blend = (
         blend_weight_contribution * buyout_net_contribution
         + blend_weight_market * buyout_market_value_share
@@ -322,6 +341,8 @@ async def project_exit_scenario(
             "debts_owed_inr": debts_owed,
             "credits_due_inr": credits_due,
             "market_value_property_currency": market_value_property_currency,
+            "total_loan_outstanding_inr": total_loan_outstanding,
+            "loan_share_inr": loan_share_inr,
         },
         "warning": warning,
     }
