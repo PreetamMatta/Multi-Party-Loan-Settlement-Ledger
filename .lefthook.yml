@@ -1,0 +1,25 @@
+fail_text: |
+  ❌ Hook failed. Fix the issues and try again.
+success_text: |
+  ✅ All checks passed!
+
+pre-commit:
+  commands:
+    ruff-format:
+      glob: "backend/**/*.py"
+      run: cd backend && .venv/bin/ruff format . --check
+      skip_output: false
+    ruff-lint:
+      glob: "backend/**/*.py"
+      run: cd backend && .venv/bin/ruff check . --fix
+      skip_output: false
+    ty-check:
+      glob: "backend/**/*.py"
+      run: cd backend && env -i /opt/homebrew/bin/ty check
+      skip_output: false
+
+pre-push:
+  commands:
+    pytest:
+      run: cd backend && .venv/bin/pytest --cov=core --cov-report=term-missing --cov-fail-under=95
+      skip_output: false
