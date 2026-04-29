@@ -166,6 +166,107 @@ root of all sorts of bugs in financial software.
 
 ---
 
+## Projection contract
+
+These four rules are the contract every projection function in
+`backend/core/balance.py` honors. They are written here so that any
+re-implementation, optimization, or alternative read path obeys the same
+semantics.
+
+### 1. Event replay order
+
+Events are replayed in `effective_date ASC, recorded_at ASC` order. The
+`recorded_at` tiebreaker matters when two events share the same business
+date: the order of insertion is the order they apply, so a same-day
+disbursement followed by same-day repayment nets correctly.
+
+### 2. `as_of_date` uses `effective_date`
+
+A query for `as_of_date = X` replays all events where
+`effective_date <= X`. Events with `effective_date > X` are excluded
+even if `recorded_at <= X`. The reverse — `recorded_at` filtering — is
+**not** a balance contract; it is an audit-trail filter only.
+
+### 3. `COMPENSATING_ENTRY` semantics
+
+A compensating entry's financial effect is the negation of the original
+event's effect. The projection engine applies it at the **compensating
+entry's own `effective_date`**, not the original's. (In practice the two
+dates are usually equal — see the rules in `event-log.md` — but a
+correction made on a different effective date applies on that date.)
+Both rows live in the log forever; balances simply sum them.
+
+### 4. Currency normalization
+
+All balances are reported in the property currency (`property_currency`
+on `properties`, e.g. `INR`). Cross-currency events are credited at
+`inr_landed` (the dual-rate rule); same-currency events are credited at
+`amount_property_currency`. The projection engine never multiplies
+`amount_source_currency × fx_rate_actual` — that quantity excludes wire
+fees and would over-credit the sender.
+
+---
+
+## Python API
+
+Implemented in `backend/core/balance.py` — all functions are async and
+read-only.
+
+```python
+async def get_interpersonal_balance(
+    lender_id, borrower_id, as_of_date, db
+) -> Decimal
+```
+Net principal owed by `borrower_id` to `lender_id` as of `as_of_date`.
+Positive = borrower owes lender. Principal only — does **not** include
+accrued interest (see `get_interpersonal_balance_with_interest` for the
+combined view).
+
+```python
+async def get_loan_balance(loan_id, as_of_date, db) -> Decimal
+```
+Outstanding principal on a single bank loan as of `as_of_date`. Floors
+at zero to guard against data-entry errors that would otherwise produce
+a negative outstanding.
+
+```python
+async def get_owner_contributions(
+    owner_id, property_id, as_of_date, db
+) -> dict
+```
+Returns `{capex_inr, opex_inr, total_inr, event_count}` for the owner up
+to `as_of_date`, in property currency. CapEx aggregates CONTRIBUTION,
+EMI principal components, and BULK_PREPAYMENT; OpEx aggregates the
+owner's share of OPEX_SPLIT rows.
+
+```python
+async def project_exit_scenario(
+    owner_id, property_id, market_value_property_currency, db,
+    blend_weight_contribution=Decimal("0.5"),
+    blend_weight_market=Decimal("0.5"),
+    as_of_date=None,
+) -> dict
+```
+Returns the three buyout numbers (net contribution, market-value share,
+weighted blend), the inputs used, the equity percentage, blend weights,
+and the outstanding loan totals used in Buyout #2. `as_of_date` defaults
+to `date.today()`; pass an explicit date for historical queries or
+deterministic tests. CPI inflation adjustment for Buyout #1 is reserved
+for Session 6.
+
+```python
+async def get_interpersonal_balance_with_interest(
+    lender_id, borrower_id, as_of_date, db
+) -> dict
+```
+Composite view that calls both `get_interpersonal_balance` and
+`calculate_accrued_interest` and returns
+`{principal_inr, accrued_interest_inr, total_owed_inr}`. Kept in Python
+rather than SQL because rate-change accrual requires procedural logic
+(see [computed-views.md](computed-views.md)).
+
+---
+
 ## The equity adjustment (one-time, t=0)
 
 The single legitimate exception to "equity is set at setup and frozen" is

@@ -137,6 +137,39 @@ Accrued interest is **summed** but not capitalized. It does not become new
 principal that itself earns interest. This is the simple-interest
 contract.
 
+### First-day rule (no interest on day of disbursement)
+
+Interest accrues from the day **after** disbursement, not the day of.
+The formula `(t2 - t1).days` enforces this naturally: a disbursement
+on day D and a query on day D+1 produces `1` day of interest, not `2`.
+A disbursement on day D queried on the same day D produces `0` days of
+interest. Practical consequence:
+
+> ₹100,000 disbursed on 2026-04-01 at 6% p.a., queried as of
+> 2026-04-01, accrues `Decimal('0')` interest. Queried as of
+> 2026-04-02, accrues `100000 * 0.06 * 1 / 365` ≈ `Decimal('16.44')`.
+
+This is the conventional banking choice (the lender doesn't earn for a
+day the borrower didn't yet have the money) and is what the chosen
+arithmetic produces. Changing this rule would change every prior balance.
+
+### Leap years still use 365
+
+The `actual/365` convention deliberately uses `365` regardless of leap
+year. A 366-day calendar year still divides by `365`, producing slightly
+more than 1.0 years of interest in a leap year — this is the intentional
+quirk of the convention. Switching to `actual/actual` (where the divisor
+is the actual length of the year) would silently shift every existing
+balance.
+
+### Zero-rate periods in FY statements
+
+If `current_rate_pct = 0` for some interval, the FY statement still
+emits a row for that interval with `rate_pct: 0.0`, `interest: 0`. It
+is **not** omitted. This makes it explicit that the period was reviewed
+and the rate was zero (rather than the period being silently skipped),
+and it preserves the audit trail when a rate later changes from zero.
+
 ### When accrued interest is paid
 
 Accrued interest is a derived quantity. It is **not stored** anywhere. To
@@ -162,34 +195,52 @@ tax filing. Both jurisdictions the system supports are documented:
 
 ### What's in a statement
 
-For a given (lender, borrower, financial-year):
+For a given (lender, borrower, financial-year), `generate_fy_statement()` returns:
 
-```
+```python
 {
-  "lender_owner_id":          UUID,
-  "borrower_owner_id":        UUID,
-  "jurisdiction":             "IN" | "US",
-  "financial_year":           int,         # the starting year
-  "fy_start":                 date,
-  "fy_end":                   date,
-  "opening_balance":          Decimal,     # principal owed at fy_start
-  "disbursements":            list[event], # all DISBURSEMENT events in the FY
-  "repayments":               list[event], # all REPAYMENT/SETTLEMENT events in the FY
-  "rate_changes":             list[event], # all RATE_CHANGE events in the FY
-  "interest_accrued_per_period": list[
-    {
-      "from": date, "to": date,
-      "rate_pct": Decimal,
-      "principal_at_start": Decimal,
-      "interest": Decimal
-    }
-  ],
-  "total_interest_accrued":   Decimal,
-  "total_disbursements":      Decimal,
-  "total_repayments":         Decimal,
-  "closing_balance":          Decimal      # principal owed at fy_end
+  "lender_id":                    UUID,
+  "borrower_id":                  UUID,
+  "calendar":                     "IN" | "US",   # "IN" = Indian FY (Apr–Mar), "US" = calendar year
+  "financial_year":               int,            # the starting year
+  "fy_start":                     date,
+  "fy_end":                       date,
+  "opening_balance_inr":          Decimal,        # principal owed at fy_start (principal only)
+  "closing_balance_inr":          Decimal,        # principal owed at fy_end (principal only)
+  "total_interest_accrued_inr":   Decimal,
+  "total_disbursed_inr":          Decimal,
+  "total_repaid_inr":             Decimal,
+  "monthly_breakdown":            list[dict],     # one entry per calendar month (always 12 rows)
+  # each monthly_breakdown entry:
+  # {
+  #   "month":            "YYYY-MM",
+  #   "opening_balance":  Decimal,     # principal at month start
+  #   "disbursements":    Decimal,
+  #   "repayments":       Decimal,
+  #   "interest_accrued": Decimal,
+  #   "closing_balance":  Decimal,     # principal at month end
+  # }
+  "events":                       list[dict],     # flat audit list of all FY events
+  # each events entry:
+  # {
+  #   "effective_date": date,
+  #   "event_type":     str,
+  #   "amount_inr":     Decimal,
+  #   "description":    str | None,
+  # }
 }
 ```
+
+> **Note on `interest_accrued_per_period`:** A per-rate-change-period breakdown
+> (showing `{from, to, rate_pct, principal_at_start, interest}` for each
+> rate-constant interval) is planned for Session 6. Until then, use
+> `monthly_breakdown` for a month-level view and `total_interest_accrued_inr`
+> for the FY total. The monthly interest figures are independently verifiable
+> from the accrual math in [Accrual math — chosen approach](#accrual-math--chosen-approach).
+
+> **Note on `opening_balance_inr` / `closing_balance_inr`:** these are
+> **principal only** — they do not include accrued interest. Use
+> `get_interpersonal_balance_with_interest()` for the combined view.
 
 ### Who needs this
 
@@ -288,6 +339,35 @@ Return a `Decimal` representing what the borrower owes the lender.
 - **Negative:** lender owes borrower (i.e., the labels in the function
   arguments were reversed; the UI should render this as the lender being
   the debtor in this pair).
+
+---
+
+## Python API
+
+Implemented in `backend/core/interest.py` — all functions are async and
+read-only against the events log. They never write.
+
+```python
+async def calculate_accrued_interest(
+    lender_id, borrower_id, period_start, period_end, db
+) -> Decimal
+```
+Total simple interest accrued on the (lender, borrower) loan within
+`[period_start, period_end]` (both inclusive). Walks all events for the
+pair from inception to `period_end`, maintaining a running principal and
+rate history; sums interest only for interval portions that overlap the
+requested window. Returns `Decimal('0')` for zero-rate periods.
+
+```python
+async def generate_fy_statement(
+    lender_id, borrower_id, financial_year, calendar="IN", db=...
+) -> dict
+```
+Per-financial-year statement for tax filing. `calendar="IN"` covers
+April 1 → March 31 of the next year; `calendar="US"` covers the
+calendar year. Returns opening / closing balance, totals, monthly
+breakdown (every month present, including zero-activity months), and a
+flat events list for audit.
 
 ---
 

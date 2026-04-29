@@ -63,17 +63,12 @@ addopts = [
 ]
 
 # Coverage is scoped to the modules implemented in the current build phase.
-# core/balance.py and core/interest.py are placeholder NotImplementedError
-# stubs for Session 3/6 — including them would tank coverage on uncovered
-# stubs and obscure the metric for the code that IS implemented. As future
-# sessions implement those modules, remove them from `omit` and the 95%
-# floor will apply automatically.
+# Session 3 added balance.py and interest.py — they are now under the 95%
+# floor.
 [tool.coverage.run]
 source = ["core"]
 branch = true
 omit = [
-    "core/balance.py",
-    "core/interest.py",
     "tests/*",
 ]
 

@@ -36,6 +36,7 @@ Read in roughly this order — each builds on the previous:
 | 3 | [interpersonal-loans.md](interpersonal-loans.md) | Inter-personal lending: forward-only rate changes, accrual math, per-FY statements, balance computation. |
 | 4 | [balances-and-equity.md](balances-and-equity.md) | The fundamental equity-vs-balance distinction, the projection model, the one-time equity adjustment. |
 | 5 | [exit-scenarios.md](exit-scenarios.md) | The three buyout numbers, the shared-floor election, what the calculator does *not* do. |
+| 6 | [computed-views.md](computed-views.md) | The read interface for the ledger: four SQL views and one Python function that consumers go through to read balances. |
 
 ## The relationship between these documents and the code
 
